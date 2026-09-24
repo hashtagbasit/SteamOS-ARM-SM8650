@@ -47,7 +47,7 @@ Switch with the Performance button, the KONKR Control plugin, or `konkrctl profi
 ## Installing
 
 1. Flash [ROCKNIX ABL](https://github.com/ROCKNIX/abl/releases) 1.1.8 or newer to `abl_a` and `abl_b`. Android still boots from its menu.
-2. Flash the image from [Releases](../../releases) to a microSD card with balenaEtcher or Rufus.
+2. Download all three `.7z` parts from [Releases](../../releases), open the `.001` one with 7-Zip or WinRAR (Keka or The Unarchiver on Mac) and extract it. Flash the `.img` you get to a 32GB+ microSD card with balenaEtcher or Rufus.
 3. Hold Volume Down while turning it on, go to Set device model, pick KONKR Pocket FIT, set boot mode to Linux and hit START.
 
 Username is `steamos`, you set the password during setup.
