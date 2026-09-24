@@ -73,9 +73,14 @@ I build everything in an arm64 Linux VM (Colima on a Mac). Kernel is in `externa
 
 Valve's files and the Steam client aren't in this repo, the build downloads them.
 
-## Support
+## Supporting the project
 
-If this is useful to you and you want to buy me a coffee: [paypal.me/Basit2000](https://paypal.me/Basit2000). Thanks!
+I work on this in my spare time and it's free. If it got your Pocket FIT running the way you wanted, a coffee really helps.
+
+<p align="left">
+  <a href="https://ko-fi.com/aimalb"><img src="https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-ff5e5b?style=for-the-badge&logo=kofi&logoColor=white" alt="Ko-fi"></a>
+  <a href="https://paypal.me/Basit2000"><img src="https://img.shields.io/badge/PayPal-Basit2000-00457c?style=for-the-badge&logo=paypal&logoColor=white" alt="PayPal"></a>
+</p>
 
 And go thank MaSi too, none of this happens without their SM8550 work.
 
