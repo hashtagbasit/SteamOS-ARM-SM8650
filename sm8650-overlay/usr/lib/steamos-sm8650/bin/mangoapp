@@ -1,0 +1,17 @@
+#!/bin/bash
+# mangoapp (Steam's Performance Overlay) is GL, and GL on the Frame image is
+# zink-on-Turnip only (no msm GL driver). zink must run on the Turnip it was
+# built with: when libvulkan_freedreno.so is swapped (A740 override on
+# SM8550, MESA-Easy-Manager, …) the pair mismatches and mangoapp coredumps —
+# which is why the SM8550 port turned the overlay off.
+#
+# gamescope --mangoapp finds this wrapper first in PATH and points zink at
+# the Frame's own Turnip, pinned at image build. Games keep whatever Turnip
+# is installed system-wide.
+PINNED_ICD=/usr/share/steamos-sm8650/frame-turnip_icd.aarch64.json
+if [[ -r "$PINNED_ICD" ]]; then
+  export VK_ICD_FILENAMES="$PINNED_ICD"
+  export VK_DRIVER_FILES="$PINNED_ICD"
+fi
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+exec /usr/bin/mangoapp "$@"

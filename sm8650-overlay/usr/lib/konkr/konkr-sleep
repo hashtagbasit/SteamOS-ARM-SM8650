@@ -1,0 +1,130 @@
+#!/bin/bash
+# konkr-sleep pre|post — make kernel s2idle safe on the KONKR Pocket FIT.
+#
+# Run by konkr-sleep.service (Before=sleep.target), i.e. before systemd-sleep
+# freezes user.slice, so PipeWire can still be told to close its ALSA devices.
+#
+# What broke s2idle before (journal, 2026-09-23):
+#   - hang on entry right after ath12k/wlan0 teardown  -> unload ath12k first
+#     (Valve does the same for ath11k on the Deck: system-sleep/modules-reload.sh)
+#   - chipone touch IRQ firing into a suspended I2C bus (-110 timeouts)
+#                                                      -> unbind it for the sleep
+#   - audio dead after resume (soundwire clock-stop / APM timeouts with a
+#     stream still open)                               -> suspend all sinks/sources
+#   - battery / USB-C / Wi-Fi / DSP / USB-host events are wake sources
+#                                                      -> only the power key wakes
+set -u
+
+TOUCH_DRV=/sys/bus/i2c/drivers/chipone-tddi
+WIFI_MODS=(ath12k_wifi7 ath12k)
+UID_STEAM=1000
+
+log() { echo "konkr-sleep: $*"; }
+
+as_user() {
+  local user
+  user=$(id -nu "$UID_STEAM" 2>/dev/null) || return 0
+  [[ -S /run/user/$UID_STEAM/pulse/native ]] || return 0
+  timeout 3 runuser -u "$user" -- env XDG_RUNTIME_DIR=/run/user/$UID_STEAM "$@" 2>/dev/null
+}
+
+audio() {  # audio 1 = suspend, 0 = resume
+  local kind name
+  for kind in sinks sources; do
+    as_user pactl list short "$kind" | while read -r _ name _; do
+      [[ $name == *.monitor ]] && continue
+      as_user pactl "suspend-${kind%s}" "$name" "$1"
+    done
+  done
+}
+
+gamescope_screen() {  # 1 = panel off (DPMS, not just backlight), 0 = on
+  [[ -S /run/user/$UID_STEAM/gamescope-0 ]] || return 0
+  timeout 3 runuser -u "$(id -nu "$UID_STEAM")" -- env XDG_RUNTIME_DIR=/run/user/$UID_STEAM \
+    GAMESCOPE_WAYLAND_DISPLAY=gamescope-0 gamescopectl drm_sleep_internal_screen "$1" >/dev/null 2>&1
+}
+
+wake_sources() {
+  local w dev
+  for w in /sys/devices/platform/pmic-glink/*/power_supply/*/power/wakeup \
+           /sys/bus/mhi/devices/mhi*/power/wakeup \
+           /sys/bus/pci/devices/*/power/wakeup \
+           /sys/devices/platform/soc@0/*.remoteproc/power/wakeup; do
+    [[ -w $w ]] || continue
+    echo disabled >"$w" 2>/dev/null
+  done
+  # keep: pmic pwrkey (power button), gpio-keys
+  for dev in /sys/devices/platform/soc@0/*.spmi/spmi-0/*/*pon*/*pwrkey /sys/devices/platform/gpio-keys; do
+    [[ -w $dev/power/wakeup ]] && echo enabled >"$dev/power/wakeup"
+  done
+}
+
+touch_off() {
+  local d n=0
+  if [[ -d $TOUCH_DRV ]]; then
+    for d in "$TOUCH_DRV"/[0-9]*-*; do
+      [[ -e $d ]] || continue
+      echo "${d##*/}" >"$TOUCH_DRV/unbind" 2>/dev/null && n=$((n + 1))
+    done
+  fi
+  echo "$n"
+}
+
+pre() {
+  local n
+  audio 1
+  wake_sources
+  n=$(touch_off)
+  if [[ -d /sys/module/${WIFI_MODS[0]} ]]; then
+    timeout 15 modprobe -r "${WIFI_MODS[@]}" || log "ath12k unload failed"
+  fi
+  sync
+  log "pre: audio suspended, touch unbound=$n, wifi=$([[ -d /sys/module/${WIFI_MODS[0]} ]] && echo loaded || echo unloaded)"
+}
+
+touch_devices() {  # chipone panels on any I2C bus, bound or not
+  local d
+  for d in /sys/bus/i2c/devices/*; do
+    [[ -r $d/of_node/compatible ]] || continue
+    tr '\0' '\n' <"$d/of_node/compatible" | grep -q '^chipone' && echo "${d##*/}"
+  done
+}
+
+touch_on() {
+  local d
+  # Rebind by DT match, not a saved list: a pre without a post (or two pres)
+  # must never leave the touchscreen detached.
+  for d in $(touch_devices); do
+    [[ -e /sys/bus/i2c/devices/$d/driver ]] || echo "$d" >"$TOUCH_DRV/bind" 2>/dev/null
+  done
+}
+
+post() {
+  touch_on
+  if [[ ! -d /sys/module/${WIFI_MODS[0]} ]]; then
+    modprobe "${WIFI_MODS[0]}" || log "ath12k reload failed"
+  fi
+  audio 0
+  # konkrd re-applies profile clocks/LEDs on SIGHUP
+  systemctl kill -s HUP konkrd.service >/dev/null 2>&1
+  log "post: restored"
+}
+
+case "${1:-}" in
+  pre) pre ;;
+  post) post ;;
+  # konkr-standby (no kernel suspend): quiet audio + touch, keep Wi-Fi
+  standby-pre)
+    audio 1
+    gamescope_screen 1
+    [[ -d /sys/module/${WIFI_MODS[0]} ]] && timeout 15 modprobe -r "${WIFI_MODS[@]}"
+    # No touch unbind here: rebinding after a long standby left the chipone
+    # panel in a ghost-touch storm (~4700 events/s) that crash-looped gamescope.
+    log "standby: prepared" ;;
+  standby-post)
+    [[ -d /sys/module/${WIFI_MODS[0]} ]] || modprobe "${WIFI_MODS[0]}"
+    audio 0 ;;
+  standby-screen-on) gamescope_screen 0 ;;
+  *) echo "usage: konkr-sleep pre|post|standby-pre|standby-post" >&2; exit 2 ;;
+esac
+exit 0

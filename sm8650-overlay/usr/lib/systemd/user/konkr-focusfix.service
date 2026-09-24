@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-activate the game after the Steam overlay/Quick Access closes
+PartOf=gamescope-session.target
+After=gamescope-session.service
+ConditionUser=!root
+
+[Service]
+ExecStart=/usr/lib/konkr/konkr-focusfix :0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=gamescope-session.target

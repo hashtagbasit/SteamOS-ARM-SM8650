@@ -1,0 +1,21 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_LS_frame_generation_arm64",
+    "type": "GLOBAL",
+    "api_version": "1.4.313",
+    "library_path": "/usr/lib/liblsfg-vk-arm64.so",
+    "implementation_version": "1",
+    "description": "Lossless Scaling frame generation layer (aarch64 build of the decky-lsfg-vk pinned fork)",
+    "functions": {
+      "vkGetInstanceProcAddr": "layer_vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "layer_vkGetDeviceProcAddr"
+    },
+    "enable_environment": {
+      "LSFG_PROCESS": "decky-lsfg-vk"
+    },
+    "disable_environment": {
+      "DISABLE_LSFG": "1"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/capability_map_v2.json
+# MCU "system" buttons from konkr_sysbtn (only present after
+# `konkr-mcu enable`). IDs follow the Elite driver (ROCKNIX 0069):
+#   HAPPY1 front-bottom-right   HAPPY2 KONKR   HAPPY3/4 LC/RC shoulder extras
+#   HAPPY5 front-top-right
+# Buttons without a Deck equivalent become F13/F14, which konkr-controls
+# turns into device actions (see /etc/konkr-controls.conf).
+version: 2
+kind: CapabilityMap
+name: KONKR Pocket FIT MCU buttons (Steam Deck layout)
+id: konkr_pocketfit_sysbtn
+
+mapping:
+  - name: Front-bottom-right → F13 (konkr-controls)
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN_TRIGGER_HAPPY1, value_type: button}
+    target_event:
+      keyboard: KeyF13
+  - name: KONKR → Quick Access
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN_TRIGGER_HAPPY2, value_type: button}
+    target_event:
+      gamepad: {button: QuickAccess}
+  - name: LC → L5
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN_TRIGGER_HAPPY3, value_type: button}
+    target_event:
+      gamepad: {button: LeftPaddle2}
+  - name: RC → R5
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN_TRIGGER_HAPPY4, value_type: button}
+    target_event:
+      gamepad: {button: RightPaddle2}
+  - name: Front-top-right → F14 (konkr-controls)
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN_TRIGGER_HAPPY5, value_type: button}
+    target_event:
+      keyboard: KeyF14
+
+filtered_events: []

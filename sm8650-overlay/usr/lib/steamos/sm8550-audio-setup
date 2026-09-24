@@ -1,0 +1,84 @@
+#!/bin/bash
+# Bring up the internal speakers once the ASoC card appears.
+#   SM8650 (KONKR Pocket FIT / AYANEO Pocket S2): card "SM8650-APS2",
+#     WSA884x speakers + WCD939x headphones, UCM from ROCKNIX.
+#   SM8550 (AYN Odin 2 family): card "AYN-Odin2", aw88166 amps on MI2S.
+# Name kept as sm8550-audio-setup so the existing units/udev rule apply.
+set +e
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
+log() { echo "sm8550-audio-setup: $*" >&2; }
+
+# ostree / image pack often leaves UCM dirs 700 steam:steam; root alsaucm
+# then cannot read them and the speakers stay silent.
+for d in /usr/share/alsa/ucm2/AYN /usr/share/alsa/ucm2/Qualcomm/sm8650 \
+         /usr/share/alsa/ucm2/conf.d/sm8550 /usr/share/alsa/ucm2/conf.d/sm8650 \
+         /usr/share/alsa/ucm2/codecs /usr/share/alsa/ucm2/lib; do
+  [[ -d "$d" ]] || continue
+  find "$d" -type d -exec chmod 0755 {} + 2>/dev/null
+  find "$d" -type f -exec chmod 0644 {} + 2>/dev/null
+done
+
+wait_card() {
+  local i
+  for i in $(seq 1 80); do
+    grep -qiE 'APS2|SM8650|AYN|Odin2|sm8550' /proc/asound/cards 2>/dev/null && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+if ! wait_card; then
+  log "no ASoC card yet"
+  cat /proc/asound/cards >&2 || true
+  exit 0
+fi
+
+ucm() {
+  local card="$1"
+  command -v alsaucm >/dev/null 2>&1 || return 1
+  alsaucm -c "$card" set _verb HiFi set _enadev Speaker >/tmp/sm8550-alsaucm.log 2>&1
+}
+
+if grep -qiE 'APS2|SM8650' /proc/asound/cards; then
+  card_id="$(awk 'BEGIN{IGNORECASE=1} /APS2|SM8650/{print $1; exit}' /proc/asound/cards)"
+  card_id="${card_id:-0}"
+  log "SM8650 card ${card_id}: $(tr '\n' ' ' </proc/asound/cards 2>/dev/null)"
+  if ucm SM8650-APS2 || ucm "hw:${card_id}"; then
+    log "alsaucm SM8650-APS2 HiFi Speaker ok"
+    # Speaker levels. PA at the Qualcomm reference (alsa-ucm-conf
+    # wsa884x/two-speakers): 12 = +9 dB. The WSA digital stage starts at its
+    # max; konkr-volume then drives it from Steam's bar with a usable curve
+    # in hardware (attenuating the S16-only PCM in software crackled).
+    amixer -c "$card_id" cset name='Speakers Volume' 12,12 >/dev/null 2>&1
+    amixer -c "$card_id" cset name='WSA_RX0 Digital Volume' 100% >/dev/null 2>&1
+    amixer -c "$card_id" cset name='WSA_RX1 Digital Volume' 100% >/dev/null 2>&1
+  else
+    log "alsaucm failed — applying HiFi routes directly"
+    cat /tmp/sm8550-alsaucm.log >&2 || true
+    amixer -c "$card_id" cset name='WSA_CODEC_DMA_RX_0 Audio Mixer MultiMedia2' 1 >/dev/null 2>&1
+    amixer -c "$card_id" cset name='RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia1' 1 >/dev/null 2>&1
+    amixer -c "$card_id" cset name='DISPLAY_PORT_RX_0 Audio Mixer MultiMedia1' 0 >/dev/null 2>&1
+  fi
+  exit 0
+fi
+
+card_id="$(awk 'BEGIN{IGNORECASE=1} /AYN|Odin2/{print $1; exit}' /proc/asound/cards)"
+card_id="${card_id:-0}"
+log "card ${card_id}: $(tr '\n' ' ' </proc/asound/cards 2>/dev/null)"
+
+if ucm AYN-Odin2 || ucm "hw:${card_id}"; then
+  log "alsaucm AYN-Odin2 HiFi Speaker ok"
+else
+  log "alsaucm failed (mixers still applied)"
+  cat /tmp/sm8550-alsaucm.log >&2 || true
+fi
+
+amixer -c "$card_id" cset name='PRIMARY_MI2S_RX Audio Mixer MultiMedia1' 1 >/dev/null 2>&1
+amixer -c "$card_id" cset name='RX_CODEC_DMA_RX_0 Audio Mixer MultiMedia2' 1 >/dev/null 2>&1
+amixer -c "$card_id" cset name='DISPLAY_PORT_RX_0 Audio Mixer MultiMedia2' 0 >/dev/null 2>&1
+amixer -c "$card_id" cset name='RX_RX0 Digital Volume' 84 >/dev/null 2>&1
+amixer -c "$card_id" cset name='RX_RX1 Digital Volume' 84 >/dev/null 2>&1
+
+log "card ${card_id} speaker mixers applied"
+exit 0

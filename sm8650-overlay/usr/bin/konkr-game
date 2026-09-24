@@ -1,0 +1,42 @@
+#!/bin/bash
+# konkr-game — per-game speed presets for Steam launch options.
+#
+#   Steam → game → Properties → Launch Options:
+#     konkr-game fast %command%
+#     konkr-game fastest %command%
+#
+# Presets (FEX-Emu options exported as FEX_<OPTION>; Proton reads the rest):
+#   fast     X87ReducedPrecision (x87 math at 64-bit instead of 80-bit — big
+#            win for older/DX9-era games), ntsync. Safe for most titles.
+#   fastest  fast + TSOEnabled=0: no x86 memory-ordering emulation. Largest
+#            CPU win, but multithreaded games can crash or corrupt state.
+#            Try per game; drop back to `fast` if it misbehaves.
+#   compat   FEX defaults + strict split locks, for games that crash.
+#
+# Defaults (no konkr-game) are FEX's own: TSO on, half-barrier TSO,
+# volatile metadata from PE files, multiblock JIT.
+set -u
+preset="${1:-}"
+case "$preset" in
+  fast|fastest|compat) shift ;;
+  *) echo "usage: konkr-game fast|fastest|compat %command%" >&2; exec "$@" ;;
+esac
+
+export PROTON_USE_NTSYNC=1
+export PROTON_NO_ESYNC=0
+case "$preset" in
+  fast)
+    export FEX_X87REDUCEDPRECISION=1
+    ;;
+  fastest)
+    export FEX_X87REDUCEDPRECISION=1
+    export FEX_TSOENABLED=0
+    ;;
+  compat)
+    export FEX_TSOENABLED=1
+    export FEX_VECTORTSOENABLED=1
+    export FEX_STRICTINPROCESSSPLITLOCKS=1
+    export FEX_X87REDUCEDPRECISION=0
+    ;;
+esac
+exec "$@"

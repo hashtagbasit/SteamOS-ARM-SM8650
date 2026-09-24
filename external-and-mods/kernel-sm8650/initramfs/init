@@ -1,0 +1,52 @@
+#!/bin/busybox sh
+# Boot initramfs for SteamOS-ARM-SM8650. Mounts the SD root, leaves the
+# kernel log from this boot in bootlog.txt on the FAT boot partition (the
+# only way to diagnose a black screen without a serial console), then
+# switch_roots. konkr.bootlog_wait=N on the cmdline adds N extra 4-second
+# log snapshots before booting (debugging display/driver bring-up).
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t devtmpfs dev /dev
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mkdir -p /boot /newroot
+
+extra=0
+for arg in $(cat /proc/cmdline); do
+  case "$arg" in konkr.bootlog_wait=*) extra="${arg#*=}" ;; esac
+done
+
+bootdev=""
+for i in $(seq 1 60); do
+  for p in /sys/class/block/mmcblk*p1; do
+    [ -e "$p" ] && bootdev="/dev/$(basename "$p")" && break 2
+  done
+  sleep 0.5
+done
+
+snap() {
+  [ -n "$bootdev" ] || return
+  {
+    echo "=== $1  uptime $(cat /proc/uptime)"
+    echo "--- cmdline"; cat /proc/cmdline
+    echo "--- partitions"; cat /proc/partitions
+    echo "--- drm"; ls /sys/class/drm 2>&1
+    echo "--- dmesg"; dmesg
+  } > /boot/bootlog.txt 2>&1
+  sync
+}
+
+if [ -n "$bootdev" ] && mount -t vfat "$bootdev" /boot; then
+  n=0
+  while [ "$n" -lt "$extra" ]; do snap "snapshot $n"; sleep 4; n=$((n + 1)); done
+fi
+
+rootdev="${bootdev%p1}p2"
+if [ -n "$bootdev" ] && mount -t ext4 -o rw "$rootdev" /newroot; then
+  snap "root mounted from $rootdev, switch_root"
+  umount /boot 2>/dev/null
+  exec switch_root /newroot /sbin/init
+fi
+snap "FAILED to mount root ($rootdev)"
+echo "root mount failed; see bootlog.txt on the FAT partition"
+exec sh

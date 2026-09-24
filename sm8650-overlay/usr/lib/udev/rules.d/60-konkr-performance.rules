@@ -1,0 +1,10 @@
+# /dev/ntsync must be usable by the game (Proton opens it as the user)
+KERNEL=="ntsync", MODE="0666"
+
+# microSD: games stream from the card (Android runs them from UFS 4.0).
+# Bigger read-ahead for sequential asset loads. BFQ with low_latency serves
+# interactive reads (UI, game assets) ahead of bulk install/download writes;
+# mq-deadline let an install stall the whole UI.
+ACTION=="add|change", KERNEL=="mmcblk[0-9]", SUBSYSTEM=="block", ATTR{queue/read_ahead_kb}="2048", ATTR{queue/scheduler}="bfq"
+ACTION=="add|change", KERNEL=="mmcblk[0-9]", SUBSYSTEM=="block", ATTR{queue/iosched/low_latency}="1"
+ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTRS{removable}=="0", ATTR{queue/read_ahead_kb}="1024"

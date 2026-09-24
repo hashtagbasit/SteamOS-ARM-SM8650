@@ -1,0 +1,16 @@
+[Unit]
+Description=KONKR Pocket FIT sleep preparation (Wi-Fi, touch, audio, wake sources)
+Before=sleep.target
+StopWhenUnneeded=yes
+ConditionPathExists=/usr/lib/konkr/konkr-sleep
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/bin/sh -c '[ -e /var/lib/konkrd/sleep-s2idle ]'
+ExecStart=/usr/lib/konkr/konkr-sleep pre
+ExecStop=/usr/lib/konkr/konkr-sleep post
+TimeoutSec=30
+
+[Install]
+WantedBy=sleep.target

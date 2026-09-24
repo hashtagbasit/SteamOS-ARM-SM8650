@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""konkrd — KONKR Pocket FIT platform daemon (SteamOS-ARM-SM8650).
+
+Fixes the platform-side gaps that make Linux slower than Android on this
+handheld and wires up the extra buttons:
+
+  fan      ROCKNIX pins the pwm-fan at 70/255 forever (0500-set-boot-fanspeed)
+           and the DT trips are not bound to it, so the SoC heat-soaks and
+           LMh throttles CPU/GPU. konkrd runs a real temperature curve.
+  profiles silent / balanced / turbo: fan curve, GPU floor/ceiling, how hard
+           game threads are boosted. Cycled by the Performance button.
+  games    threads of Steam-launched games (descendants of `reaper
+           SteamLaunch`) are kept off the Cortex-A520 little cores and get a
+           uclamp.min boost so schedutil ramps the big cores immediately —
+           what Android's game mode / WALT does for GameNative.
+  gpu      devfreq polling 50 ms → 16 ms so the GPU clock follows frame load.
+  buttons  F13/F14 from the InputPlumber keyboard (MCU extra buttons, see
+           konkr_pocketfit_sysbtn.yaml) run configurable actions.
+  leds     power LED: profile colour flash, then charge state.
+
+Config: /etc/konkrd.conf   State: /var/lib/konkrd/state.json
+Control: konkrctl (sends SIGHUP after editing state).
+"""
+from __future__ import annotations
+
+import configparser
+import ctypes
+import errno
+import glob
+import json
+import os
+import select
+import signal
+import struct
+import sys
+import time
+
+CONF = "/etc/konkrd.conf"
+STATE_DIR = "/var/lib/konkrd"
+STATE = f"{STATE_DIR}/state.json"
+PROFILES = ("silent", "balanced", "turbo")
+
+# temp °C → pwm 0..255, linearly interpolated
+FAN_CURVES = {
+    "silent":   [(55, 0), (65, 45), (75, 85), (85, 150), (93, 255)],
+    "balanced": [(50, 35), (60, 60), (70, 100), (80, 160), (90, 255)],
+    "turbo":    [(45, 90), (60, 140), (70, 200), (80, 255)],
+}
+# fraction of the GPU OPP range: (floor, ceiling)
+GPU_RANGE = {"silent": (0.0, 0.75), "balanced": (0.0, 1.0), "turbo": (0.35, 1.0)}
+# per-thread uclamp.min for game threads (0..1024)
+GAME_UCLAMP = {"silent": 0, "balanced": 256, "turbo": 512}
+# The Steam UI path. Mainline EAS parks these bursty, light threads on the
+# Cortex-A520s (capacity 216 vs 855 on the big cores) — gamescope and
+# Xwayland were measured on cpu1 — which makes every menu feel laggy.
+# Android keeps the foreground app on big cores; do the same.
+UI_COMMS = {"gamescope-wl", "Xwayland", "steam", "steamwebhelper",
+            "gamescopereaper", "mangoapp", "inputplumber",
+            # Desktop Mode: same problem, compositor + shell on the A520s
+            "kwin_wayland", "kwin_x11", "plasmashell", "krunner",
+            "konsole", "dolphin", "plasma-discover", "systemsettings"}
+UI_UCLAMP = {"silent": 128, "balanced": 200, "turbo": 300}
+# Disk priority (BFQ honours it). The microSD does ~1.6 MB/s of 4K writes;
+# a Steam download from the `steam` client process must not queue ahead of
+# the UI's and the game's reads.
+IOPRIO_CLASS_BE = 2
+IO_UI, IO_GAME, IO_DOWNLOAD = 0, 2, 7          # best-effort levels, 0 = highest
+IO_LOW_COMMS = {"steam"}                       # does the downloading/installing
+SYS_IOPRIO_SET = 30                            # aarch64
+IOPRIO_WHO_PROCESS = 1
+
+
+def set_ioprio(pid: int, level: int) -> None:
+    _libc.syscall(SYS_IOPRIO_SET, IOPRIO_WHO_PROCESS, pid, (IOPRIO_CLASS_BE << 13) | level)
+PROFILE_RGB = {"silent": (0, 90, 255), "balanced": (0, 255, 60), "turbo": (255, 30, 0)}
+
+EV_KEY = 1
+KEY_F13, KEY_F14, KEY_F15 = 183, 184, 185
+INPUT_EVENT = struct.Struct("llHHi")
+
+
+def log(msg: str) -> None:
+    print(f"konkrd: {msg}", flush=True)
+
+
+def rd(path: str, default: str = "") -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def wr(path: str, value) -> bool:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(value))
+        return True
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- state ----
+def load_state() -> dict:
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("profile", "balanced")
+    st.setdefault("rgb", {"mode": "static", "color": "ff3c00", "brightness": 160})
+    st.setdefault("fan", {"mode": "auto", "fixed": 50, "boost": False})
+    st.setdefault("power_led", True)
+    st.setdefault("buttons", {"F13": "rgb-next", "F14": "profile-next"})
+    if st["rgb"].get("mode") == "rainbow":
+        st["rgb"]["mode"] = "static"
+    if st["profile"] not in PROFILES:
+        st["profile"] = "balanced"
+    return st
+
+
+def save_state(st: dict) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh, indent=2)
+    os.replace(tmp, STATE)
+
+
+def load_conf() -> configparser.ConfigParser:
+    cp = configparser.ConfigParser()
+    cp.read_dict({
+        "buttons": {"F13": "rgb-next", "F14": "profile-next", "F15": "none"},
+        "fan": {"enabled": "yes", "min_pwm": "0", "failsafe_pwm": "180"},
+        "games": {"boost": "yes", "avoid_little_cores": "yes"},
+    })
+    cp.read(CONF)
+    return cp
+
+
+# ------------------------------------------------------------------ fan ----
+def find_fan() -> str | None:
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if rd(f"{d}/name") == "pwmfan":
+            return d
+    return None
+
+
+def soc_temp_c() -> float:
+    """Hottest CPU/GPU tsens zone, °C."""
+    hottest = 0.0
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        t = rd(f"{z}/type")
+        if not (t.startswith("cpu") or t.startswith("gpu") or "gpuss" in t):
+            continue
+        try:
+            hottest = max(hottest, int(rd(f"{z}/temp", "0")) / 1000.0)
+        except ValueError:
+            pass
+    return hottest
+
+
+def hottest_zone() -> str:
+    best, name = -1.0, "?"
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        t = rd(f"{z}/type")
+        if not (t.startswith("cpu") or t.startswith("gpu") or "gpuss" in t):
+            continue
+        try:
+            v = int(rd(f"{z}/temp", "0")) / 1000.0
+        except ValueError:
+            continue
+        if v > best:
+            best, name = v, t
+    return name
+
+
+def curve_pwm(curve, temp: float) -> int:
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    for (t0, p0), (t1, p1) in zip(curve, curve[1:]):
+        if temp <= t1:
+            return int(p0 + (p1 - p0) * (temp - t0) / (t1 - t0))
+    return curve[-1][1]
+
+
+class Fan:
+    def __init__(self, conf):
+        self.dir = find_fan()
+        self.enabled = conf.getboolean("fan", "enabled") and self.dir is not None
+        self.min_pwm = conf.getint("fan", "min_pwm")
+        self.failsafe = conf.getint("fan", "failsafe_pwm")
+        self.cur = -1
+        self.smooth = None
+        self.set_temp = 0.0
+        if self.enabled:
+            wr(f"{self.dir}/pwm1_enable", 1)
+            log(f"fan: {self.dir}")
+        elif self.dir is None:
+            log("fan: no pwmfan hwmon found")
+
+    def tick(self, profile: str, fan: dict | None = None) -> None:
+        if not self.enabled:
+            return
+        fan = fan or {}
+        raw = soc_temp_c()
+        if raw >= 90:
+            fan = {"mode": "auto"}           # safety: never hold a low fixed speed when hot
+        if fan.get("mode") == "fixed":
+            step = max(0, min(255, int(int(fan.get("fixed", 50)) * 2.55)))
+            if step != self.cur and wr(f"{self.dir}/pwm1", step):
+                log(f"fan: fixed {fan.get('fixed')}% -> pwm {step}")
+                self.cur = step
+            return
+        if fan.get("boost"):
+            profile = "turbo"
+        # Smooth short spikes (boot, shader compiles) but react at once to
+        # genuinely hot readings.
+        if self.smooth is None or raw >= 85:
+            self.smooth = raw
+        else:
+            self.smooth = 0.75 * self.smooth + 0.25 * raw
+        temp = self.smooth
+        want = max(self.min_pwm, curve_pwm(FAN_CURVES[profile], temp))
+        if want > self.cur:
+            step = want                          # up: immediately
+            self.set_temp = temp
+        elif want < self.cur and temp <= self.set_temp - 3:
+            step = max(want, self.cur - 15)      # down: once 3 °C below, ramp
+        else:
+            return
+        if step != self.cur and wr(f"{self.dir}/pwm1", step):
+            if abs(step - self.cur) >= 40 or self.cur < 0:
+                log(f"fan: {temp:.1f} C ({hottest_zone()}) -> pwm {step}")
+            self.cur = step
+
+    def failsafe_now(self) -> None:
+        if self.dir:
+            wr(f"{self.dir}/pwm1", self.failsafe)
+
+
+# ------------------------------------------------------------------ gpu ----
+def gpu_devfreq() -> str | None:
+    for d in glob.glob("/sys/class/devfreq/*"):
+        if "gpu" in os.path.basename(d) or "3d00000" in d:
+            return d
+    return None
+
+
+def apply_gpu(profile: str) -> None:
+    d = gpu_devfreq()
+    if not d:
+        return
+    freqs = sorted(int(f) for f in rd(f"{d}/available_frequencies").split() if f.isdigit())
+    if not freqs:
+        return
+    lo, hi = GPU_RANGE[profile]
+    fmin = freqs[int(lo * (len(freqs) - 1))]
+    fmax = freqs[int(round(hi * (len(freqs) - 1)))]
+    # order matters: never set min above the current max
+    wr(f"{d}/max_freq", freqs[-1])
+    wr(f"{d}/min_freq", fmin)
+    wr(f"{d}/max_freq", fmax)
+    wr(f"{d}/polling_interval", 16)
+
+
+def apply_cpu(profile: str) -> None:
+    """schedutil everywhere (the ROCKNIX default is `performance`, which
+    holds all eight cores — little A520s included — at max clock: heat for
+    nothing). Turbo pins only the big clusters to `performance`."""
+    big = big_cpus()
+    for pol in glob.glob("/sys/devices/system/cpu/cpufreq/policy*"):
+        govs = rd(f"{pol}/scaling_available_governors")
+        cpus = {int(c) for c in rd(f"{pol}/related_cpus").split() if c.isdigit()}
+        gov = "schedutil"
+        if profile == "turbo" and cpus and cpus <= big and "performance" in govs:
+            gov = "performance"
+        if gov in govs:
+            wr(f"{pol}/scaling_governor", gov)
+        if gov == "schedutil":
+            wr(f"{pol}/schedutil/rate_limit_us", 500)
+        wr(f"{pol}/scaling_max_freq", rd(f"{pol}/cpuinfo_max_freq"))
+
+
+def big_cpus() -> set[int]:
+    """CPUs not in the lowest-capacity cluster (drops the Cortex-A520s)."""
+    caps = {}
+    for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
+        n = int(os.path.basename(c)[3:])
+        try:
+            caps[n] = int(rd(f"{c}/cpu_capacity", "0")) or int(rd(f"{c}/cpufreq/cpuinfo_max_freq", "0"))
+        except ValueError:
+            caps[n] = 0
+    if not caps:
+        return set()
+    low = min(caps.values())
+    big = {n for n, v in caps.items() if v > low}
+    return big or set(caps)
+
+
+# ---------------------------------------------------------- game boost ----
+class SchedAttr(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("sched_policy", ctypes.c_uint32),
+                ("sched_flags", ctypes.c_uint64), ("sched_nice", ctypes.c_int32),
+                ("sched_priority", ctypes.c_uint32), ("sched_runtime", ctypes.c_uint64),
+                ("sched_deadline", ctypes.c_uint64), ("sched_period", ctypes.c_uint64),
+                ("sched_util_min", ctypes.c_uint32), ("sched_util_max", ctypes.c_uint32)]
+
+
+SYS_SCHED_SETATTR = 274  # aarch64
+SCHED_FLAG_KEEP_ALL = 0x08 | 0x10
+SCHED_FLAG_UTIL_CLAMP_MIN = 0x20
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+def set_uclamp_min(tid: int, value: int) -> bool:
+    attr = SchedAttr()
+    attr.size = ctypes.sizeof(SchedAttr)
+    attr.sched_flags = SCHED_FLAG_KEEP_ALL | SCHED_FLAG_UTIL_CLAMP_MIN
+    attr.sched_util_min = value
+    return _libc.syscall(SYS_SCHED_SETATTR, tid, ctypes.byref(attr), 0) == 0
+
+
+def scan_procs() -> tuple[set[int], list[int]]:
+    """One /proc pass: (game pids, UI pids). Descendants of Steam's
+    `reaper SteamLaunch` are the game; UI_COMMS outside it are the UI.
+    comm comes from stat, and cmdline is read only for `reaper`: this runs
+    every second, and reading three files per process cost ~5 % CPU idle."""
+    children: dict[int, list[int]] = {}
+    roots, ui = [], []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        pid = int(p)
+        try:
+            with open(f"/proc/{p}/stat", "rb") as fh:
+                stat = fh.read()
+            r = stat.rfind(b")")
+            comm = stat[stat.find(b"(") + 1:r].decode(errors="replace")
+            ppid = int(stat[r + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+        if comm in UI_COMMS:
+            ui.append(pid)
+        elif comm == "reaper":
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as fh:
+                    cmd = fh.read()
+            except OSError:
+                continue
+            # argv: /…/reaper SteamLaunch AppId=<id> -- <game>
+            if b"reaper\0SteamLaunch\0" in cmd:
+                roots.append(pid)
+    out, stack = set(), list(roots)
+    while stack:
+        pid = stack.pop()
+        for c in children.get(pid, ()):
+            if c not in out:
+                out.add(c)
+                stack.append(c)
+    return out, [u for u in ui if u not in out]
+
+
+class GameBoost:
+    def __init__(self, conf):
+        self.enabled = conf.getboolean("games", "boost")
+        self.avoid_little = conf.getboolean("games", "avoid_little_cores")
+        self.big = big_cpus()
+        self.done: dict[int, int] = {}  # tid → uclamp value applied
+
+    def tick(self, profile: str) -> None:
+        if not self.enabled:
+            return
+        live = set()
+        games, ui = scan_procs()
+        targets = [(pid, GAME_UCLAMP[profile]) for pid in games]
+        targets += [(pid, UI_UCLAMP[profile]) for pid in ui]
+        games_set = set(games)
+        for pid, val in targets:
+            if pid in games_set:
+                io = IO_GAME
+            elif rd(f"/proc/{pid}/comm") in IO_LOW_COMMS:
+                io = IO_DOWNLOAD
+            else:
+                io = IO_UI
+            for t in glob.glob(f"/proc/{pid}/task/*"):
+                tid = int(os.path.basename(t))
+                live.add(tid)
+                if self.done.get(tid) == val:
+                    continue
+                set_ioprio(tid, io)
+                try:
+                    if self.avoid_little and self.big:
+                        os.sched_setaffinity(tid, self.big)
+                except OSError:
+                    pass
+                set_uclamp_min(tid, val)
+                self.done[tid] = val
+        for tid in list(self.done):
+            if tid not in live:
+                del self.done[tid]
+
+
+# ------------------------------------------------------- steam ui fix ----
+WEBHELPER_SH = "/home/steamos/.local/share/Steam/steamrtarm64/steamwebhelper.sh"
+WEBHELPER_EXEC = 'exec taskset 0x7c $(pwd)/steamwebhelper "$@" &> ~/.steam/steam/logs/steamwebhelper.log'
+KONKR_CEF = (
+    "# SteamOS-ARM-SM8650: draw the Steam UI through ANGLE's Vulkan backend on\n"
+    "# Turnip directly. The default (ANGLE -> GL -> zink -> Vulkan) converts every\n"
+    "# UI draw call twice on the CPU and made menus/game pages sluggish.\n"
+    'KONKR_CEF_FLAGS="--use-gl=angle --use-angle=vulkan '
+    '--enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE"\n'
+    'exec taskset 0x7c $(pwd)/steamwebhelper "$@" $KONKR_CEF_FLAGS &> ~/.steam/steam/logs/steamwebhelper.log'
+)
+
+
+def ensure_webhelper_vulkan() -> None:
+    """Re-apply the ANGLE-Vulkan flags if a Steam client update rewrote the
+    launcher (Steam restarts the UI on its own after updates)."""
+    s = rd(WEBHELPER_SH)
+    if not s or "KONKR_CEF_FLAGS" in s or WEBHELPER_EXEC not in s:
+        return
+    try:
+        tmp = WEBHELPER_SH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(s.replace(WEBHELPER_EXEC, KONKR_CEF) + "\n")
+        st = os.stat(WEBHELPER_SH)
+        os.chown(tmp, st.st_uid, st.st_gid)
+        os.chmod(tmp, st.st_mode)
+        os.replace(tmp, WEBHELPER_SH)
+        log("steamwebhelper.sh: re-applied ANGLE-Vulkan UI flags")
+    except OSError as exc:
+        log(f"steamwebhelper.sh: {exc}")
+
+
+# ----------------------------------------------------------------- leds ----
+def led(pattern: str) -> str | None:
+    for d in glob.glob(f"/sys/class/leds/*{pattern}*"):
+        if os.path.exists(f"{d}/multi_intensity"):
+            return d
+    return None
+
+
+def led_rgb(d: str | None, rgb, brightness: int = 255) -> None:
+    if not d:
+        return
+    wr(f"{d}/multi_intensity", " ".join(str(c) for c in rgb))
+    wr(f"{d}/brightness", brightness)
+
+
+def battery() -> tuple[int, str]:
+    for b in glob.glob("/sys/class/power_supply/*"):
+        if rd(f"{b}/type") == "Battery":
+            try:
+                return int(rd(f"{b}/capacity", "0")), rd(f"{b}/status")
+            except ValueError:
+                pass
+    return -1, ""
+
+
+class Leds:
+    def __init__(self):
+        self.power = led("power-led")
+        self.sticks = led("joysticks")
+        self.flash_until = 0.0
+        self.pulse = False
+
+    def flash(self, rgb) -> None:
+        led_rgb(self.power, rgb, 255)
+        self.flash_until = time.monotonic() + 2.0
+
+    def tick(self, enabled: bool = True) -> None:
+        if not self.power or time.monotonic() < self.flash_until:
+            return
+        if not enabled or os.path.exists(STANDBY_FLAG):
+            wr(f"{self.power}/brightness", 0)
+            return
+        cap, status = battery()
+        if status == "Charging":
+            led_rgb(self.power, (255, 120, 0), 40)
+        elif status == "Full" or (status == "Not charging" and cap >= 99):
+            led_rgb(self.power, (0, 255, 0), 30)
+        elif 0 <= cap < 15:
+            self.pulse = not self.pulse
+            led_rgb(self.power, (255, 0, 0), 60 if self.pulse else 0)
+        else:
+            wr(f"{self.power}/brightness", 0)
+
+    def apply_sticks(self, st: dict) -> None:
+        if not self.sticks:
+            return
+        cfg = st["rgb"]
+        mode = cfg.get("mode", "static")
+        if mode == "off":
+            wr(f"{self.sticks}/brightness", 0)
+            return
+        color = cfg.get("color", "ff3c00")
+        rgb = tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+        eff = f"{self.sticks}/effect"
+        if mode == "breath":
+            wr(eff, "breath {} {} {}".format(*rgb))
+        else:
+            wr(eff, "static")
+            led_rgb(self.sticks, rgb, int(cfg.get("brightness", 160)))
+
+
+RGB_PRESETS = [("static", "ff3c00"), ("static", "00b4ff"), ("static", "a000ff"),
+               ("static", "ffffff"), ("breath", "ff0040"), ("off", "000000")]
+STANDBY_FLAG = "/run/konkr-standby"
+
+
+# -------------------------------------------------------------- hotkeys ----
+def hotkey_devices() -> list[str]:
+    """InputPlumber keyboard (F13/F14 from the MCU buttons) + the PMIC power
+    key. The Frame's steamos-powerbuttond is Requisite=steamvr.service (VR
+    only), so nothing forwards the power button to Steam in Game Mode."""
+    out = []
+    for ev in glob.glob("/sys/class/input/event*"):
+        name = rd(f"{ev}/device/name")
+        if ("InputPlumber" in name and "Keyboard" in name) or name == "pmic_pwrkey":
+            out.append(f"/dev/input/{os.path.basename(ev)}")
+    return out
+
+
+KEY_POWER = 116
+LONG_PRESS_S = 1.0
+
+
+def steam_url(url: str) -> None:
+    """Ask the running Steam client (user steamos) to handle a steam:// URL."""
+    import pwd
+    import subprocess
+    try:
+        uid = pwd.getpwnam("steamos").pw_uid
+    except KeyError:
+        return
+    env = {"HOME": "/home/steamos", "USER": "steamos", "DISPLAY": ":0",
+           "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+           "PATH": "/usr/bin:/bin"}
+    subprocess.Popen(["runuser", "-u", "steamos", "--", "/usr/bin/steam", "-ifrunning", url],
+                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class Hotkeys:
+    def __init__(self):
+        self.fds: dict[int, str] = {}
+        self.last_scan = 0.0
+
+    def rescan(self) -> None:
+        if time.monotonic() - self.last_scan < 5:
+            return
+        self.last_scan = time.monotonic()
+        have = set(self.fds.values())
+        for path in hotkey_devices():
+            if path in have:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                self.fds[fd] = path
+                log(f"hotkeys: listening on {path}")
+            except OSError:
+                pass
+
+    def poll(self, timeout: float) -> list[int]:
+        self.rescan()
+        if not self.fds:
+            time.sleep(timeout)
+            return []
+        r, _, _ = select.select(list(self.fds), [], [], timeout)
+        keys = []
+        for fd in r:
+            try:
+                data = os.read(fd, INPUT_EVENT.size * 64)
+            except OSError as e:
+                if e.errno in (errno.ENODEV, errno.EBADF):
+                    os.close(fd)
+                    self.fds.pop(fd, None)
+                continue
+            for off in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+                _s, _u, etype, code, value = INPUT_EVENT.unpack_from(data, off)
+                if etype == EV_KEY and value in (0, 1):
+                    keys.append((code, value))
+        return keys
+
+
+# ----------------------------------------------------------------- main ----
+class Daemon:
+    def __init__(self):
+        self.conf = load_conf()
+        self.st = load_state()
+        self.fan = Fan(self.conf)
+        self.games = GameBoost(self.conf)
+        self.leds = Leds()
+        self.keys = Hotkeys()
+        self.reload = False
+        signal.signal(signal.SIGHUP, lambda *_: setattr(self, "reload", True))
+        signal.signal(signal.SIGTERM, self.stop)
+        self.apply_profile(flash=False)
+        self.leds.apply_sticks(self.st)
+
+    def stop(self, *_):
+        self.fan.failsafe_now()
+        log("stopped (fan at failsafe)")
+        sys.exit(0)
+
+    def apply_profile(self, flash: bool = True) -> None:
+        p = self.st["profile"]
+        apply_cpu(p)
+        apply_gpu(p)
+        self.games.done.clear()
+        if flash:
+            self.leds.flash(PROFILE_RGB[p])
+        log(f"profile {p}")
+
+    def action(self, name: str) -> None:
+        if name == "profile-next":
+            i = PROFILES.index(self.st["profile"])
+            self.st["profile"] = PROFILES[(i + 1) % len(PROFILES)]
+            save_state(self.st)
+            self.apply_profile()
+        elif name in ("profile-silent", "profile-balanced", "profile-turbo"):
+            self.st["profile"] = name.split("-", 1)[1]
+            save_state(self.st)
+            self.apply_profile()
+        elif name == "fan-boost":
+            self.st["fan"]["boost"] = not self.st["fan"].get("boost")
+            save_state(self.st)
+            self.leds.flash((255, 255, 255) if self.st["fan"]["boost"] else (60, 60, 60))
+            log(f"fan boost {'on' if self.st['fan']['boost'] else 'off'}")
+        elif name == "sticks-toggle":
+            rgb = self.st["rgb"]
+            if rgb.get("mode") == "off":
+                rgb["mode"] = rgb.get("last_mode", "static")
+                rgb["color"] = rgb.get("last_color", "ff3c00")
+            else:
+                rgb["last_mode"], rgb["last_color"] = rgb.get("mode"), rgb.get("color")
+                rgb["mode"] = "off"
+            save_state(self.st)
+            self.leds.apply_sticks(self.st)
+        elif name == "rgb-next":
+            cur = (self.st["rgb"].get("mode"), self.st["rgb"].get("color"))
+            i = RGB_PRESETS.index(cur) + 1 if cur in RGB_PRESETS else 0
+            mode, color = RGB_PRESETS[i % len(RGB_PRESETS)]
+            self.st["rgb"].update(mode=mode, color=color)
+            save_state(self.st)
+            self.leds.apply_sticks(self.st)
+            if not self.leds.sticks:
+                rgb = tuple(int(color[j:j + 2], 16) for j in (0, 2, 4))
+                self.leds.flash(rgb)
+
+    def run(self) -> None:
+        keymap = {KEY_F13: "F13", KEY_F14: "F14", KEY_F15: "F15"}
+        next_slow = 0.0
+        next_ui_check = 0.0
+        power_down_at = None
+        power_long_sent = False
+        while True:
+            timeout = 0.1 if power_down_at is not None else 0.5
+            for code, value in self.keys.poll(timeout):
+                if os.path.exists(STANDBY_FLAG):
+                    continue                 # konkr-standby owns the buttons
+                if code == KEY_POWER:
+                    if value == 1:
+                        power_down_at, power_long_sent = time.monotonic(), False
+                    elif power_down_at is not None:
+                        if not power_long_sent:
+                            steam_url("steam://shortpowerpress")
+                        power_down_at = None
+                    continue
+                name = keymap.get(code)
+                if name and value == 1:
+                    act = self.st.get("buttons", {}).get(name) or \
+                        self.conf.get("buttons", name, fallback="none")
+                    self.action(act)
+            if (power_down_at is not None and not power_long_sent
+                    and time.monotonic() - power_down_at >= LONG_PRESS_S):
+                steam_url("steam://longpowerpress")
+                power_long_sent = True
+            if self.reload:
+                self.reload = False
+                self.conf = load_conf()
+                self.st = load_state()
+                self.apply_profile()
+                self.leds.apply_sticks(self.st)
+            now = time.monotonic()
+            if now >= next_ui_check:
+                next_ui_check = now + 60.0
+                ensure_webhelper_vulkan()
+            if now >= next_slow:
+                next_slow = now + 1.0
+                p = self.st["profile"]
+                self.fan.tick(p, self.st.get("fan"))
+                self.leds.tick(self.st.get("power_led", True))
+                self.games.tick(p)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        sys.exit("konkrd must run as root")
+    try:
+        Daemon().run()
+    except Exception as exc:  # never leave the fan at a low fixed speed
+        f = find_fan()
+        if f:
+            wr(f"{f}/pwm1", 180)
+        log(f"fatal: {exc!r}")
+        raise

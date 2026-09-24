@@ -1,0 +1,14 @@
+aarch64 build of https://github.com/xXJSONDeruloXx/lsfg-vk tag fp16-test-2 (the
+fork decky-lsfg-vk 0.12.2 pins), built natively on the device with clang:
+  python3 liblsfg-vk-arm64.patch.py            # skip Wine helper processes
+  python3 liblsfg-vk-arm64.dispatch-patch.py   # per-chain dispatch, swapchain-only hooking
+  cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,nodelete"
+  ninja -C build
+Why: the plugin only ships an x86-64 liblsfg-vk.so (skipped by the arm64 loader).
+Upstream kept next-layer proc addrs in globals; in Proton ARM64 Wine's explorer.exe
+that routed a device into MangoHud's GetDeviceProcAddr from another chain -> NULL
+deref -> winex11.drv init failure -> SIGSEGV loop, games stuck "launching".
+Layer manifest: /usr/share/vulkan/implicit_layer.d/VkLayer_LS_frame_generation_arm64.json
+(enabled only when LSFG_PROCESS=decky-lsfg-vk, which ~/lsfg exports).
+Verified 2026-09-24: Dying Light (Proton 11 ARM64) runs with frame generation.

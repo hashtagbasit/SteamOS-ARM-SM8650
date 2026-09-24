@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the Flathub app catalog
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1d
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

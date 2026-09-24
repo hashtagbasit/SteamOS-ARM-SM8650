@@ -1,0 +1,16 @@
+[Unit]
+Description=KONKR Pocket FIT speaker volume curve
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service wireplumber.service
+ConditionPathExists=/sys/firmware/devicetree/base/model
+# root's user manager (SSH logins) has no PipeWire session
+ConditionUser=!root
+
+[Service]
+ExecCondition=/bin/sh -c 'grep -qaE "KONKR Pocket FIT|AYANEO Pocket S2" /sys/firmware/devicetree/base/model'
+ExecStart=/usr/lib/konkr/konkr-volume
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

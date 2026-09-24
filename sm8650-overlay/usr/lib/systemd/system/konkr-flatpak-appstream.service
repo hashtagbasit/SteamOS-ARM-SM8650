@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch the Flathub app catalog (Discover lists and searches nothing without it)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/bin/flatpak
+
+[Service]
+Type=oneshot
+# The image ships the flathub remote but never downloaded its appstream; Discover
+# 6.4's flatpak backend does not trigger the first fetch on its own.
+ExecStart=/usr/bin/flatpak update --appstream --noninteractive
+Nice=10
+IOSchedulingClass=idle

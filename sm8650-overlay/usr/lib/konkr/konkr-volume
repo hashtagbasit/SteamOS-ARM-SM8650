@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""konkr-volume — usable, clean volume for the Pocket FIT speakers.
+
+Steam's volume bar (like every PulseAudio client) is cubic: 20 % on the bar
+is 0.2^3 of full amplitude, -42 dB, and the lower third of the bar was
+silent on these small speakers.
+
+This daemon keeps Steam's value (channelVolumes) untouched — the bar never
+jumps — and applies a gentler curve in HARDWARE, on the WSA macro's digital
+volume (WSA_RX0/RX1 Digital Volume: 1 dB steps, -84..-3 dB, processed at
+the codec's internal precision). The speaker PCM only takes S16_LE, so
+attenuating in software instead (softVolumes) threw away bits and added an
+audible crackle/grit that got worse the lower it went. softVolumes stay at
+1.0 (or 0 when muted).
+
+    applied dB = -34 * (1 - v) ** 1.35       (relative to the stage maximum)
+
+    bar   1 %   5 %  10 %  20 %  30 %  50 %  75 %  100 %
+    dB  -33.5 -31.7 -29.5 -25.2 -21.0 -13.3 -5.2    0
+
+The amplifier (PA) stays at the Qualcomm reference, set by sm8550-audio-setup.
+Runs as the session user (systemd --user; member of the audio group).
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import threading
+import time
+
+SINK = "alsa_output.platform-sound.HiFi__Speaker__sink"
+CARD = "0"
+DIGITAL = ("WSA_RX0 Digital Volume", "WSA_RX1 Digital Volume")
+
+
+def run(*cmd: str) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def node_id(name: str) -> str | None:
+    cur = None
+    for line in run("pw-cli", "ls", "Node").splitlines():
+        m = re.match(r"\s*id (\d+),", line)
+        if m:
+            cur = m.group(1)
+        elif f'node.name = "{name}"' in line and cur:
+            return cur
+    return None
+
+
+def bar_position() -> tuple[float, bool] | None:
+    m = re.search(r"/\s*(\d+)%", run("pactl", "get-sink-volume", SINK))
+    if not m:
+        return None
+    return int(m.group(1)) / 100.0, "yes" in run("pactl", "get-sink-mute", SINK)
+
+
+def digital_max() -> int:
+    m = re.search(r"max=(\d+)", run("amixer", "-c", CARD, "cget", f"name={DIGITAL[0]}"))
+    return int(m.group(1)) if m else 81
+
+
+def target_steps(v: float, vmax: int) -> int:
+    """Hardware register value for bar position v (1 dB per step, 0 = mute)."""
+    if v <= 0.0:
+        return 0
+    v = min(v, 1.0)
+    db = -34.0 * (1.0 - v) ** 1.35
+    return max(1, min(vmax, vmax + round(db)))
+
+
+class Volume:
+    def __init__(self) -> None:
+        self.vmax = digital_max()
+        self.nid: str | None = None
+        self.last: tuple[int, float] | None = None
+        self.lock = threading.Lock()
+
+    def soft(self) -> float | None:
+        if not self.nid:
+            return None
+        try:
+            data = json.loads(run("pw-dump", self.nid) or "[]")
+        except ValueError:
+            return None
+        for o in data:
+            for prm in (o.get("info", {}).get("params", {}).get("Props") or []):
+                if prm.get("softVolumes"):
+                    return float(prm["softVolumes"][0])
+        return None
+
+    def apply(self, force: bool = False) -> None:
+        with self.lock:
+            pos = bar_position()
+            if pos is None:
+                return
+            v, muted = pos
+            steps = 0 if muted else target_steps(v, self.vmax)
+            soft = 0.0 if (muted or v <= 0.0) else 1.0
+            self.nid = self.nid or node_id(SINK)
+            if not self.nid:
+                return
+            if force or self.last != (steps, soft):
+                for ctl in DIGITAL:
+                    run("amixer", "-c", CARD, "-q", "cset", f"name={ctl}", str(steps))
+            cur = self.soft()
+            if cur is None or abs(cur - soft) > 1e-3:
+                out = run("pw-cli", "set-param", self.nid, "Props",
+                          "{ softVolumes: [ %.3f, %.3f ] }" % (soft, soft))
+                if "error" in out.lower():
+                    self.nid = None
+            self.last = (steps, soft)
+
+
+def main() -> None:
+    vol = Volume()
+    vol.apply(force=True)
+
+    def periodic() -> None:
+        # ACP puts softVolumes back to the cubic value on node resume/route
+        # changes; re-check every few seconds (writes only on drift).
+        while True:
+            time.sleep(3)
+            vol.nid = None
+            vol.apply()
+
+    threading.Thread(target=periodic, daemon=True).start()
+    while True:
+        p = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+        assert p.stdout
+        for line in p.stdout:
+            if "on sink" in line or "on server" in line or "on card" in line:
+                vol.apply()
+        p.wait()
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

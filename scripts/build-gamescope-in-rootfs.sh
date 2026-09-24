@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Build MaSi's MSM gamescope *inside* the Frame rootfs (glibc 2.39, Frame
+# wlroots/libdrm/vulkan), like build-box64-in-rootfs.sh.
+#
+# The vendored tree in external-and-mods/gamescope has no git submodules.
+# It forks Valve's steam-gamescope-viewport branch at 818fdbd (Sep 2025);
+# the matching subprojects (wlroots 54e8447, libliftoff 8b08dc1, vkroots
+# 5106d8a, libdisplay-info 66b802d, openvr ff87f68) are fetched by
+# fetch_subprojects below.
+#
+# Usage: build-gamescope-in-rootfs.sh <rootfs> [build-dir]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+R="$(cd "${1:?rootfs}" && pwd)"
+WORKDIR="${STEAMOS_WORK:-/work}"
+BUILD="${2:-${WORKDIR}/gamescope-build}"
+SRC="${WORKDIR}/gamescope-src"
+SUBS="${WORKDIR}/gamescope-subprojects"
+UPSTREAM_REF="818fdbd804c4c3381f6c24d57af2552bf17963d9"
+
+log() { printf '==> [gamescope] %s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+command -v bwrap >/dev/null || die "bwrap required (apt install bubblewrap)"
+[[ -x "$R/usr/bin/meson" && -x "$R/usr/bin/gcc" ]] \
+  || die "rootfs needs meson+gcc (scripts/install-build-deps-in-rootfs.sh)"
+
+fetch_subprojects() {
+  [[ -f "$SUBS/wlroots/meson.build" ]] && return 0
+  log "fetching subprojects at upstream ${UPSTREAM_REF}"
+  local g="${WORKDIR}/gamescope-upstream"
+  rm -rf "$g"
+  git clone -q --filter=blob:none https://github.com/ValveSoftware/gamescope.git "$g"
+  git -C "$g" checkout -q "$UPSTREAM_REF"
+  git -C "$g" submodule update -q --init --depth 1 \
+    subprojects/wlroots subprojects/libliftoff subprojects/vkroots \
+    subprojects/libdisplay-info subprojects/openvr
+  mkdir -p "$SUBS"
+  rsync -a --exclude .git "$g/subprojects/" "$SUBS/"
+}
+
+fetch_subprojects
+log "staging source → $SRC"
+rm -rf "$SRC"
+mkdir -p "$SRC"
+rsync -a "${ROOT}/external-and-mods/gamescope/" "$SRC/"
+rsync -a "$SUBS/" "$SRC/subprojects/"
+
+run() {
+  bwrap --bind "$R" / \
+    --bind "$SRC" /src/gamescope \
+    --bind "$(dirname "$BUILD")" /build-parent \
+    --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --unshare-pid --die-with-parent --chdir /src/gamescope \
+    --setenv PATH /usr/bin:/usr/local/bin \
+    "$@"
+}
+
+bname="$(basename "$BUILD")"
+rm -rf "$BUILD"
+mkdir -p "$BUILD"
+log "meson setup (Frame rootfs)"
+run meson setup "/build-parent/${bname}" \
+  --buildtype=release -Dpipewire=enabled -Denable_openvr_support=false \
+  -Dinput_emulation=enabled -Dbenchmark=disabled \
+  --force-fallback-for=wlroots,libliftoff,vkroots
+log "ninja"
+run ninja -C "/build-parent/${bname}"
+[[ -x "$BUILD/src/gamescope" ]] || die "no gamescope binary"
+if strings "$BUILD/src/gamescope" | grep -q 'GLIBC_2\.4[0-9]'; then
+  die "gamescope links against a newer glibc than the Frame"
+fi
+log "OK: $BUILD/src/gamescope"

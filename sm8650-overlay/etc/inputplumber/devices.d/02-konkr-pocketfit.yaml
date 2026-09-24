@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+# KONKR Pocket FIT / AYANEO Pocket S2 (SM8650) → virtual Steam Deck
+# controller (deck-uhid; valid in InputPlumber ≥ 0.70 even though the
+# bundled JSON schema does not list it) + keyboard (OSK, F13/F14 hotkeys).
+#
+# Sources (each optional — the composite forms from whichever appear):
+#   - built-in pad: XInput on the internal USB bus (045e:028e; older MCU
+#     firmware enumerates as 1c4f:0002). An external Xbox 360 pad has the
+#     same IDs; pin it with `phys_path` once the internal path is known
+#     (`konkr-controls --list` prints it).
+#   - "KONKR System Buttons": konkr_sysbtn MCU driver (opt-in, konkr-mcu).
+version: 1
+kind: CompositeDevice
+name: KONKR Pocket FIT
+
+matches:
+  - udev:
+      sys_path: /sys/firmware/devicetree/base
+      attributes:
+        - name: model
+          value: KONKR Pocket FIT
+  - udev:
+      sys_path: /sys/firmware/devicetree/base
+      attributes:
+        - name: model
+          value: AYANEO Pocket S2
+
+single_source: false
+
+source_devices:
+  - group: gamepad
+    evdev:
+      vendor_id: "045e"
+      product_id: "028e"
+      handler: event*
+    capability_map_id: konkr_pocketfit_deck
+  - group: gamepad
+    evdev:
+      vendor_id: "1c4f"
+      product_id: "0002"
+      handler: event*
+    capability_map_id: konkr_pocketfit_deck
+  - group: gamepad
+    evdev:
+      name: KONKR System Buttons
+      handler: event*
+    capability_map_id: konkr_pocketfit_sysbtn
+
+options:
+  auto_manage: true
+
+target_devices:
+  - deck-uhid
+  - keyboard

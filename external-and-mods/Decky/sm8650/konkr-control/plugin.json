@@ -1,0 +1,12 @@
+{
+  "name": "KONKR Control",
+  "author": "SteamOS-ARM-SM8650",
+  "api_version": 1,
+  "flags": ["root"],
+  "version": "1.0.0",
+  "publish": {
+    "tags": ["konkr", "pocket-fit", "sm8650", "fan", "rgb", "performance"],
+    "description": "Performance profiles, fan, stick RGB and extra-button setup for the KONKR Pocket FIT.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-loader"
+  }
+}

@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""konkr-standby — safe "sleep" for the KONKR Pocket FIT.
+
+Kernel suspend (s2idle and deep) does not reliably resume on the 7.1.2 kernel:
+the device looked powered off and needed a forced restart. Steam's Sleep goes
+through logind → systemd-suspend.service, which the port overrides to run
+this instead. It:
+
+  - pauses the running game (SIGSTOP on the Steam-launched process tree),
+  - suspends audio, detaches the touch panel, unloads Wi-Fi and has
+    gamescope power the panel off (konkr-sleep standby-pre),
+  - freezes the whole user session (user.slice: Steam, gamescope, mangoapp,
+    PipeWire), so nothing in userspace wakes the CPUs,
+  - turns the panel backlight and the LEDs off,
+  - takes the big cores offline, drops the little ones to their lowest clock
+    and caps the GPU,
+  - blocks until the power button is pressed again (or SIGUSR1, for testing
+    over SSH: Wi-Fi stays up), then restores it all.
+
+Steam sees a normal suspend/resume cycle (PrepareForSleep false → true →
+false). Nothing enters kernel suspend, so there is nothing to fail to wake.
+"""
+from __future__ import annotations
+
+import glob
+import os
+import select
+import signal
+import struct
+import sys
+import time
+
+FLAG = "/run/konkr-standby"
+EV = struct.Struct("llHHi")
+EV_KEY, KEY_POWER = 1, 116
+
+
+def rd(p: str, d: str = "") -> str:
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return d
+
+
+def wr(p: str, v) -> None:
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(str(v))
+    except OSError:
+        pass
+
+
+def wr_ok(p: str, v) -> bool:
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(str(v))
+        return True
+    except OSError:
+        return False
+
+
+def run(*cmd: str) -> int:
+    import subprocess
+    try:
+        return subprocess.run(cmd, check=False, timeout=20,
+                              stdout=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+
+
+def big_cpus() -> list[int]:
+    """CPUs above the lowest capacity (the A520s stay online)."""
+    caps = {}
+    for c in glob.glob("/sys/devices/system/cpu/cpu[0-9]*"):
+        n = int(os.path.basename(c)[3:])
+        v = rd(f"{c}/cpu_capacity", "0")
+        caps[n] = int(v) if v.isdigit() else 0
+    if not caps:
+        return []
+    low = min(caps.values())
+    return sorted(n for n, v in caps.items() if v > low and n != 0)
+
+
+def log(msg: str) -> None:
+    print(f"konkr-standby: {msg}", flush=True)
+
+
+def game_pids() -> list[int]:
+    children: dict[int, list[int]] = {}
+    roots = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit():
+            continue
+        try:
+            with open(f"/proc/{p}/stat", "rb") as fh:
+                st = fh.read()
+            ppid = int(st[st.rfind(b")") + 2:].split()[1])
+            with open(f"/proc/{p}/cmdline", "rb") as fh:
+                cmd = fh.read()
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(p))
+        if b"reaper\0SteamLaunch\0" in cmd:
+            roots.append(int(p))
+    out, stack = [], list(roots)
+    while stack:
+        pid = stack.pop()
+        for c in children.get(pid, ()):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def power_key_fd() -> int | None:
+    for e in glob.glob("/sys/class/input/event*"):
+        if rd(f"{e}/device/name") == "pmic_pwrkey":
+            return os.open(f"/dev/input/{os.path.basename(e)}", os.O_RDONLY)
+    return None
+
+
+WAKE_R, WAKE_W = os.pipe()
+
+
+def wait_power_press(fd: int) -> None:
+    """Block until a full press+release of the power key, or SIGUSR1."""
+    pressed = False
+    while True:
+        r, _, _ = select.select([fd, WAKE_R], [], [])
+        if WAKE_R in r:
+            log("wake requested (SIGUSR1)")
+            return
+        data = os.read(fd, EV.size * 64)
+        for off in range(0, len(data) - EV.size + 1, EV.size):
+            _s, _u, t, code, val = EV.unpack_from(data, off)
+            if t == EV_KEY and code == KEY_POWER:
+                if val == 1:
+                    pressed = True
+                elif val == 0 and pressed:
+                    log("wake: power key")
+                    return
+
+
+def main() -> int:
+    fd = power_key_fd()
+    if fd is None:
+        log("no power key device; not entering standby")
+        return 1
+    open(FLAG, "w").close()
+    saved: dict[str, str] = {}
+    paused: list[int] = []
+    offlined: list[int] = []
+    frozen = False
+    try:
+        # Drain the press that triggered sleep, so its release is not the wake.
+        time.sleep(0.6)
+        os.set_blocking(fd, False)
+        try:
+            while os.read(fd, EV.size * 64):
+                pass
+        except BlockingIOError:
+            pass
+        os.set_blocking(fd, True)
+
+        signal.signal(signal.SIGUSR1, lambda *_: os.write(WAKE_W, b"x"))
+        for pid in game_pids():
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                paused.append(pid)
+            except OSError:
+                pass
+        for bl in glob.glob("/sys/class/backlight/*"):
+            saved[f"{bl}/brightness"] = rd(f"{bl}/brightness")
+            wr(f"{bl}/brightness", 0)
+        for led in glob.glob("/sys/class/leds/*"):
+            if "joystick" in led or "power-led" in led:
+                saved[f"{led}/brightness"] = rd(f"{led}/brightness")
+                wr(f"{led}/brightness", 0)
+        run("/usr/lib/konkr/konkr-sleep", "standby-pre")
+        time.sleep(0.3)               # let gamescope commit the panel-off
+        frozen = run("systemctl", "freeze", "user.slice") == 0
+        for pol in glob.glob("/sys/devices/system/cpu/cpufreq/policy*"):
+            saved[f"{pol}/scaling_max_freq"] = rd(f"{pol}/scaling_max_freq")
+            wr(f"{pol}/scaling_max_freq", rd(f"{pol}/cpuinfo_min_freq"))
+        for cpu in big_cpus():
+            if wr_ok(f"/sys/devices/system/cpu/cpu{cpu}/online", 0):
+                offlined.append(cpu)
+        for gpu in glob.glob("/sys/class/devfreq/*gpu*"):
+            saved[f"{gpu}/max_freq"] = rd(f"{gpu}/max_freq")
+            freqs = sorted(int(f) for f in rd(f"{gpu}/available_frequencies").split() if f.isdigit())
+            if freqs:
+                wr(f"{gpu}/max_freq", freqs[0])
+        log(f"standby: paused {len(paused)} game processes, user.slice "
+            f"{'frozen' if frozen else 'NOT frozen'}, cpus {offlined} offline, screen off")
+        wait_power_press(fd)
+        log("wake")
+    finally:
+        for cpu in offlined:
+            wr(f"/sys/devices/system/cpu/cpu{cpu}/online", 1)
+        if frozen:
+            run("systemctl", "thaw", "user.slice")
+        run("/usr/lib/konkr/konkr-sleep", "standby-screen-on")
+        for path, val in saved.items():
+            if val:
+                wr(path, val)
+        run("/usr/lib/konkr/konkr-sleep", "standby-post")
+        for pid in paused:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
+        time.sleep(0.5)               # let the wake release settle before konkrd sees keys
+        try:
+            os.remove(FLAG)
+        except OSError:
+            pass
+        os.close(fd)
+        # konkrd re-applies profile clocks/LEDs on SIGHUP
+        os.system("systemctl kill -s HUP konkrd.service >/dev/null 2>&1")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

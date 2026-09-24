@@ -1,0 +1,17 @@
+[[device]]
+dt.compatible = "konkr,pocket-fit"
+device = "konkr_pocketfit"
+variant = "PocketFIT"
+friendly_name = "KONKR Pocket FIT"
+
+[[device]]
+dt.compatible = "ayaneo,pocket-s2"
+device = "konkr_pocketfit"
+variant = "PocketS2"
+friendly_name = "AYANEO Pocket S2"
+
+[inputplumber]
+# keyboard target carries F13/F14 from the MCU buttons (KONKR → stick lights,
+# Performance → profile) to konkrd; steamos-manager applies this list at
+# session start, so dropping "keyboard" here silently kills those buttons.
+target_devices = ["deck-uhid", "keyboard"]
