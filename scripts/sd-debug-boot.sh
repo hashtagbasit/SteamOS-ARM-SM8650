@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJ="$(cd "${HERE}/.." && pwd)"
-OVL="${PROJ}/odin-overlay"
+OVL="${PROJ}/steamos-overlay"
 BOOT="${BOOT:-/run/media/steam/BOOT}"
 R="${ROOTFS_MNT:-/run/media/steam/root}"
 H="${HOME_MNT:-/run/media/steam/home}"

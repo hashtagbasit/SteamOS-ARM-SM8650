@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 R="${1:-${ROOT}/rootfs}"
-OVL="${ROOT}/odin-overlay"
+OVL="${ROOT}/steamos-overlay"
 CACHE="${ROOT}/external-and-mods/InputPlumber"
 IP_VER="${INPUTPLUMBER_VERSION:-0.78.1}"
 TGZ="${CACHE}/inputplumber-aarch64.tar.gz"

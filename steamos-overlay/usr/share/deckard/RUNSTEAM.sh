@@ -72,7 +72,7 @@ fi
 # ResourceHandler serves on-disk steamui/ when present. 0-byte stubs or a
 # missing tree produce a blank steamloopback page (no libraries.js).
 # The Frame tarball client never finishes the library. Prefer the handheld
-# ARM client extracted by apply-odin-mods / install-steam-client-arm64.
+# ARM client extracted by apply-overlays / install-steam-client-arm64.
 steam_tar=/usr/lib/steam/steam.tar.zst
 if [[ ! -e "${STEAMROOT}/.odin-handheld-client" && -f "$steam_tar" ]]; then
   if [[ ! -s "${STEAMROOT}/steamui/index.html" ]] \

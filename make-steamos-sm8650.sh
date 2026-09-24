@@ -14,7 +14,7 @@ SCRIPTS="${ROOT}/scripts"
 WORKDIR="${STEAMOS_WORK:-/work}"
 R="${STEAMOS_ROOTFS:-${WORKDIR}/rootfs}"
 MOD="${ROOT}/external-and-mods"
-OVL="${ROOT}/odin-overlay"
+OVL="${ROOT}/steamos-overlay"
 KOUT="${KERNEL_OUT:-${WORKDIR}/kernel-sm8650/output/current}"
 BOX64_SRC="${BOX64_SRC:-${MOD}/BOX64/box64}"
 BOX64_BUILD="${BOX64_BUILD:-/tmp/box64-build-frame}"
@@ -60,7 +60,7 @@ usage() {
 Usage: $0 [options]
 
   --skip-download   Reuse existing official rootfs/ chunks
-  --skip-apply      Do not re-run scripts/apply-odin-mods.sh
+  --skip-apply      Do not re-run scripts/apply-overlays.sh
   --skip-box64      Do not rebuild Box64
   --image-only      Only pack the .img from the current rootfs
   --img PATH        Output image (default: ${IMG})
@@ -122,10 +122,10 @@ ensure_official_rootfs() {
 }
 
 apply_mods() {
-  [[ "$SKIP_APPLY" -eq 1 ]] && { log "Skipping apply-odin-mods"; return 0; }
-  [[ -x "${SCRIPTS}/apply-odin-mods.sh" ]] || die "missing scripts/apply-odin-mods.sh"
+  [[ "$SKIP_APPLY" -eq 1 ]] && { log "Skipping apply-overlays"; return 0; }
+  [[ -x "${SCRIPTS}/apply-overlays.sh" ]] || die "missing scripts/apply-overlays.sh"
   log "Applying kernel / gamescope / MangoHud / Mesa / Decky / apps"
-  "${SCRIPTS}/apply-odin-mods.sh"
+  "${SCRIPTS}/apply-overlays.sh"
 }
 
 build_box64() {

@@ -8,7 +8,7 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 R="${1:-${ROOT}/rootfs}"
 R="$(cd "$R" && pwd)"
 MOD="${ROOT}/external-and-mods"
-OVL="${ROOT}/odin-overlay"
+OVL="${ROOT}/steamos-overlay"
 HOME_DST="${STEAMOS_HOME:-$R/home/steamos}"
 
 log() { echo "== system-fixes: $*"; }
