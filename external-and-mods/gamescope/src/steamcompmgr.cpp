@@ -4340,12 +4340,19 @@ const char *get_win_display_name(steamcompmgr_win_t *window)
 }
 
 
+// konkr: Steam app id that currently owns the shared Android window, set by
+// konkr-apk on the root window before it starts an app.
+static uint32_t g_unKonkrAndroidAppId = 0;
+
 static std::vector< steamcompmgr_win_t* >
 steamcompmgr_xdg_get_possible_focus_windows()
 {
 	std::vector< steamcompmgr_win_t* > windows;
 	for ( auto &win : g_steamcompmgr_xdg_wins )
 	{
+		if ( win->bKonkrAndroid )
+			win->appID = g_unKonkrAndroidAppId;
+
 		// Always skip system tray icons and overlays
 		if ( win->isSysTrayIcon || win->isOverlay || win->isExternalOverlay )
 		{
@@ -4442,7 +4449,21 @@ determine_and_apply_focus( global_focus_t *pFocus )
 	for ( steamcompmgr_win_t *focusable_window : vecPossibleFocusWindows )
 	{
 		if ( focusable_window->type != steamcompmgr_win_type_t::XWAYLAND )
+		{
+			// konkr: report xdg-shell apps (e.g. Lepton's Android window) too, or
+			// Steam never sees the game's window and keeps its launch screen up.
+			uint32_t unXdgAppID = focusable_window->appID;
+			if ( focusable_window->type == steamcompmgr_win_type_t::XDG && unXdgAppID != 0 )
+			{
+				if ( std::find( focusable_appids.begin(), focusable_appids.end(), unXdgAppID ) == focusable_appids.end() )
+					focusable_appids.push_back( unXdgAppID );
+				// xdg ids are small serials, X11 ids never are
+				focusable_windows.push_back( focusable_window->xdg().id );
+				focusable_windows.push_back( unXdgAppID );
+				focusable_windows.push_back( focusable_window->pid );
+			}
 			continue;
+		}
 
 		// Exclude windows that are useless (1x1), skip taskbar + pager or override redirect windows
 		// from the reported focusable windows to Steam.
@@ -6081,6 +6102,11 @@ handle_property_notify(xwayland_ctx_t *ctx, XPropertyEvent *ev)
 		get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlAppIDAtom, vecFocuscontrolAppIDs );
 		MakeFocusDirty();
 	}
+	if ( ev->atom == ctx->atoms.konkrAndroidAppIDAtom )
+	{
+		g_unKonkrAndroidAppId = get_prop( ctx, ctx->root, ctx->atoms.konkrAndroidAppIDAtom, 0 );
+		MakeFocusDirty();
+	}
 	if (ev->atom == ctx->atoms.gamescopeCtrlWindowAtom )
 	{
 		ctx->focusControlWindow = get_prop( ctx, ctx->root, ctx->atoms.gamescopeCtrlWindowAtom, None );
@@ -7014,7 +7040,8 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 					focusWindow_engine = w->engineName;
 				}
 
-				if ( ctx->focus.focusWindow && win_is_viewport_target_of( w, ctx->focus.focusWindow ) )
+				// ctx is null for xdg-shell windows (e.g. Lepton's Android window).
+				if ( ctx && ctx->focus.focusWindow && win_is_viewport_target_of( w, ctx->focus.focusWindow ) )
 				{
 					hasRepaint = true;
 				}
@@ -7948,6 +7975,7 @@ void init_xwayland_ctx(uint32_t serverId, gamescope_xwayland_server_t *xwayland_
 	ctx->atoms.gamescopeFocusedAppGfxAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_APP_GFX", false );
 	ctx->atoms.gamescopeFocusedWindowAtom = XInternAtom( ctx->dpy, "GAMESCOPE_FOCUSED_WINDOW", false );
 	ctx->atoms.gamescopeCtrlAppIDAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_APPID", false);
+	ctx->atoms.konkrAndroidAppIDAtom = XInternAtom(ctx->dpy, "KONKR_ANDROID_APPID", false);
 	ctx->atoms.gamescopeCtrlWindowAtom = XInternAtom(ctx->dpy, "GAMESCOPECTRL_BASELAYER_WINDOW", false);
 	ctx->atoms.WMChangeStateAtom = XInternAtom(ctx->dpy, "WM_CHANGE_STATE", false);
 	ctx->atoms.gamescopeInputCounterAtom = XInternAtom(ctx->dpy, "GAMESCOPE_INPUT_COUNTER", false);

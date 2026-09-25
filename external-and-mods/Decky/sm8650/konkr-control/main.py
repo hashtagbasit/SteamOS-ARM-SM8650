@@ -73,12 +73,46 @@ def telemetry() -> dict[str, Any]:
     return out
 
 
+def mode_of(st: dict[str, Any]) -> tuple[str, bool]:
+    return st["profile"], bool(st["fan"].get("boost"))
+
+
 class Plugin:
     async def _main(self) -> None:
+        self.watcher = asyncio.create_task(self._watch_mode())
         decky.logger.info("KONKR Control ready")
 
     async def _unload(self) -> None:
-        pass
+        self.watcher.cancel()
+
+    # The KONKR/Performance button goes straight to konkrd, so the frontend
+    # would only see a change once the panel is opened. Watch konkrd's state
+    # and tell the frontend, which shows a toast over whatever is running.
+    async def _watch_mode(self) -> None:
+        try:
+            await self._watch_mode_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            decky.logger.exception("mode watcher stopped")
+
+    async def _watch_mode_loop(self) -> None:
+        stamp = None
+        mode = mode_of(load())
+        while True:
+            await asyncio.sleep(0.25)
+            try:
+                cur = os.stat(STATE).st_mtime_ns
+            except OSError:
+                continue
+            if cur == stamp:
+                continue
+            stamp = cur
+            new = mode_of(load())
+            if new != mode:
+                old, mode = mode, new
+                decky.logger.info(f"mode {old} -> {new}")
+                await decky.emit("konkr_mode", new[0], new[1], old[0] != new[0])
 
     async def get_state(self, **_: Any) -> dict[str, Any]:
         st = load()

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <fstream>
 #include <xf86drm.h>
 #include <sys/eventfd.h>
 
@@ -1900,6 +1901,28 @@ void xdg_toplevel_new(struct wl_listener *listener, void *data)
 
 uint32_t get_appid_from_pid( pid_t pid );
 
+// konkr: Lepton (Android) draws from a podman container, outside Steam's
+// reaper tree, so get_appid_from_pid finds nothing. A per-app launch still
+// runs in the launch's systemd scope (app-steam-app<N>-<pid>.scope); the
+// shared konkr-android.service window follows KONKR_ANDROID_APPID instead.
+static uint32_t get_container_appid( pid_t pid, steamcompmgr_win_t *window )
+{
+	char path[64];
+	snprintf( path, sizeof( path ), "/proc/%d/cgroup", pid );
+	std::ifstream cgroup( path );
+	std::string line;
+	while ( std::getline( cgroup, line ) )
+	{
+		size_t nPos = line.find( "app-steam-app" );
+		uint32_t unAppId = 0;
+		if ( nPos != std::string::npos && sscanf( line.c_str() + nPos, "app-steam-app%u", &unAppId ) == 1 && unAppId )
+			return unAppId;
+		if ( line.find( "konkr-android.service" ) != std::string::npos )
+			window->bKonkrAndroid = true;
+	}
+	return 0;
+}
+
 wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, struct wlr_surface *surface)
 {
 	wlserver_wl_surface_info *wlserver_surface = get_wl_surface_info(surface);
@@ -1922,6 +1945,8 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 		pid_t nPid = 0;
 		wl_client_get_credentials( client, &nPid, nullptr, nullptr );
 		window->appID = get_appid_from_pid( nPid );
+		if ( !window->appID )
+			window->appID = get_container_appid( nPid, window.get() );
 	}
 	window->_window_types.emplace<steamcompmgr_xdg_win_t>();
 
@@ -2892,6 +2917,19 @@ static void apply_touchscreen_orientation(double *x, double *y )
 	*y = ty;
 }
 
+// konkr: Android (Lepton) wants real touch — scrolling, swipes, pinch — not
+// Steam's click emulation, which non-Steam titles get by default.
+static gamescope::TouchClickMode wlserver_touch_click_mode()
+{
+	if ( wlserver.mouse_focus_surface != NULL )
+	{
+		wlserver_wl_surface_info *info = get_wl_surface_info( wlserver.mouse_focus_surface );
+		if ( info && info->xdg_surface && info->xdg_surface->win && info->xdg_surface->win->bKonkrAndroid )
+			return gamescope::TouchClickModes::Passthrough;
+	}
+	return GetBackend()->GetTouchClickMode();
+}
+
 void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool bAlwaysWarpCursor )
 {
 	assert( wlserver_is_lock_held() );
@@ -2919,7 +2957,7 @@ void wlserver_touchmotion( double x, double y, int touch_id, uint32_t time, bool
 		trackpad_dx = tx - wlserver.mouse_surface_cursorx;
 		trackpad_dy = ty - wlserver.mouse_surface_cursory;
 
-		gamescope::TouchClickMode eMode = GetBackend()->GetTouchClickMode();
+		gamescope::TouchClickMode eMode = wlserver_touch_click_mode();
 
 		if ( eMode == gamescope::TouchClickModes::Passthrough )
 		{
@@ -2965,7 +3003,7 @@ void wlserver_touchdown( double x, double y, int touch_id, uint32_t time )
 		tx *= focusedWindowScaleX;
 		ty *= focusedWindowScaleY;
 
-		gamescope::TouchClickMode eMode = GetBackend()->GetTouchClickMode();
+		gamescope::TouchClickMode eMode = wlserver_touch_click_mode();
 
 		if ( eMode == gamescope::TouchClickModes::Passthrough )
 		{

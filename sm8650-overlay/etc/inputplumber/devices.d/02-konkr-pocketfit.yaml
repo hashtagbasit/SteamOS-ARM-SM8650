@@ -5,9 +5,8 @@
 #
 # Sources (each optional — the composite forms from whichever appear):
 #   - built-in pad: XInput on the internal USB bus (045e:028e; older MCU
-#     firmware enumerates as 1c4f:0002). An external Xbox 360 pad has the
-#     same IDs; pin it with `phys_path` once the internal path is known
-#     (`konkr-controls --list` prints it).
+#     firmware enumerates as 1c4f:0002), plus anything else on its internal
+#     port (usb-0001:01:00.0-2) whatever id it reports.
 #   - "KONKR System Buttons": konkr_sysbtn MCU driver (opt-in, konkr-mcu).
 version: 1
 kind: CompositeDevice
@@ -38,6 +37,15 @@ source_devices:
     evdev:
       vendor_id: "1c4f"
       product_id: "0002"
+      handler: event*
+    capability_map_id: konkr_pocketfit_deck
+  # Whatever is on the pad's internal USB port: some units report another
+  # USB id (controller mode/firmware), and unclaimed, Steam shows the raw pad
+  # with the Xbox layout and no Quick Access. InputPlumber matches phys_path
+  # literally (no globs); tested on hardware.
+  - group: gamepad
+    evdev:
+      phys_path: usb-0001:01:00.0-2/input0
       handler: event*
     capability_map_id: konkr_pocketfit_deck
   - group: gamepad

@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""apk-info APK [ICON_OUT]
+
+Prints three lines: package, label, launcher activity. With ICON_OUT, also
+writes the app's launcher icon (largest PNG; for adaptive icons the
+foreground layer) there.
+
+Reads the binary AndroidManifest.xml and resolves label/icon references
+through resources.arsc, so it needs no Android tools.
+"""
+import struct
+import sys
+import zipfile
+
+NAME, ENABLED, LABEL, ICON = 0x01010003, 0x0101000E, 0x01010001, 0x01010002
+T_REFERENCE, T_STRING, T_BOOLEAN = 0x01, 0x03, 0x12
+
+
+def string_pool(d, pos):
+    _, hsz, _ = struct.unpack_from("<HHI", d, pos)
+    n, _, flags, sstart = struct.unpack_from("<IIII", d, pos + 8)
+    utf8 = flags & 0x100
+    out = []
+    for i in range(n):
+        o = pos + sstart + struct.unpack_from("<I", d, pos + hsz + 4 * i)[0]
+        if utf8:
+            o += 2 if d[o] & 0x80 else 1
+            ln = d[o]
+            o += 1
+            if ln & 0x80:
+                ln = ((ln & 0x7F) << 8) | d[o]
+                o += 1
+            out.append(d[o:o + ln].decode("utf-8", "replace"))
+        else:
+            ln = struct.unpack_from("<H", d, o)[0]
+            o += 2
+            if ln & 0x8000:
+                ln = ((ln & 0x7FFF) << 16) | struct.unpack_from("<H", d, o)[0]
+                o += 2
+            out.append(d[o:o + 2 * ln].decode("utf-16-le", "replace"))
+    return out
+
+
+def axml(d):
+    """Yield ('start', tag, {attr: (str, type, data)}) / ('end', tag)."""
+    strings, resmap, pos = [], [], 8
+    while pos < len(d):
+        typ, hsz, sz = struct.unpack_from("<HHI", d, pos)
+        if typ == 0x0001:
+            strings = string_pool(d, pos)
+        elif typ == 0x0180:
+            resmap = list(struct.unpack_from("<%dI" % ((sz - hsz) // 4), d, pos + hsz))
+        elif typ == 0x0102:
+            tag = strings[struct.unpack_from("<I", d, pos + 20)[0]]
+            attrs = {}
+            for a in range(struct.unpack_from("<H", d, pos + 28)[0]):
+                _, an, raw, _, _, dtype, val = struct.unpack_from("<IIIHBBI", d, pos + 36 + 20 * a)
+                key = resmap[an] if an < len(resmap) and resmap[an] else strings[an]
+                attrs[key] = (strings[raw] if raw != 0xFFFFFFFF else None, dtype, val)
+            yield "start", tag, attrs
+        elif typ == 0x0103:
+            yield "end", strings[struct.unpack_from("<I", d, pos + 20)[0]], None
+        pos += sz
+
+
+class Resources:
+    """Just enough of resources.arsc to resolve simple (non-bag) values."""
+
+    def __init__(self, d):
+        self.values = {}  # resid -> [(config bytes, dtype, data)]
+        self.strings = []
+        _, hsz, _ = struct.unpack_from("<HHI", d, 0)
+        pos = hsz
+        while pos < len(d):
+            typ, chsz, sz = struct.unpack_from("<HHI", d, pos)
+            if typ == 0x0001:
+                self.strings = string_pool(d, pos)
+            elif typ == 0x0200:
+                self._package(d, pos, chsz, sz)
+            pos += sz
+
+    def _package(self, d, base, hsz, size):
+        pkg_id = struct.unpack_from("<I", d, base + 8)[0]
+        pos = base + hsz
+        while pos < base + size:
+            typ, chsz, sz = struct.unpack_from("<HHI", d, pos)
+            if typ == 0x0201:
+                tid, flags = d[pos + 8], d[pos + 9]
+                count, estart = struct.unpack_from("<II", d, pos + 12)
+                csize = struct.unpack_from("<I", d, pos + 20)[0]
+                config = d[pos + 20:pos + 20 + csize]
+                offsets = []
+                if flags & 0x01:  # sparse: (idx, offset/4) pairs
+                    for i in range(count):
+                        idx, off = struct.unpack_from("<HH", d, pos + chsz + 4 * i)
+                        offsets.append((idx, off * 4))
+                else:
+                    for i in range(count):
+                        off = struct.unpack_from("<I", d, pos + chsz + 4 * i)[0]
+                        if off != 0xFFFFFFFF:
+                            offsets.append((i, off))
+                for idx, off in offsets:
+                    e = pos + estart + off
+                    esize, eflags = struct.unpack_from("<HH", d, e)
+                    if eflags & 0x0001:  # complex (bag)
+                        continue
+                    _, _, dtype, data = struct.unpack_from("<HBBI", d, e + esize)
+                    resid = (pkg_id << 24) | (tid << 16) | idx
+                    self.values.setdefault(resid, []).append((config, dtype, data))
+            pos += sz
+
+    @staticmethod
+    def _lang(config):
+        return config[8:10] if len(config) >= 10 else b"\0\0"
+
+    @staticmethod
+    def _density(config):
+        return struct.unpack_from("<H", config, 14)[0] if len(config) >= 16 else 0
+
+    def string(self, resid, depth=0):
+        vals = self.values.get(resid, [])
+        # default config first, then English, then anything
+        order = sorted(vals, key=lambda v: (self._lang(v[0]) not in (b"\0\0",), self._lang(v[0]) != b"en"))
+        for _, dtype, data in order:
+            if dtype == T_STRING:
+                return self.strings[data]
+            if dtype == T_REFERENCE and depth < 5:
+                s = self.string(data, depth + 1)
+                if s:
+                    return s
+        return ""
+
+    def files(self, resid, depth=0):
+        """File paths for a drawable/mipmap, highest density first."""
+        out = []
+        for config, dtype, data in self.values.get(resid, []):
+            if dtype == T_STRING:
+                d = self._density(config)
+                out.append((0xFFFE if d in (0xFFFF, 0xFFFE) else d, self.strings[data]))
+            elif dtype == T_REFERENCE and depth < 5:
+                out += [(0, p) for p in self.files(data, depth + 1)]
+        return [p for _, p in sorted(out, reverse=True)]
+
+
+def main():
+    apk = zipfile.ZipFile(sys.argv[1])
+    icon_out = sys.argv[2] if len(sys.argv) > 2 else None
+    res = Resources(apk.read("resources.arsc")) if "resources.arsc" in apk.namelist() else None
+
+    pkg = label = activity = ""
+    icon_ref = None
+    comp = None  # [name, enabled, has_main, has_launcher]
+    stack = []
+    for kind, tag, a in axml(apk.read("AndroidManifest.xml")):
+        if kind == "start":
+            stack.append(tag)
+            if tag == "manifest":
+                pkg = (a.get("package") or ("",))[0] or ""
+            elif tag == "application":
+                if LABEL in a:
+                    raw, dtype, val = a[LABEL]
+                    label = raw if dtype == T_STRING else (res.string(val) if res and dtype == T_REFERENCE else "")
+                if ICON in a and a[ICON][1] == T_REFERENCE:
+                    icon_ref = a[ICON][2]
+            elif tag in ("activity", "activity-alias"):
+                en = a.get(ENABLED)
+                enabled = not (en and en[1] == T_BOOLEAN and en[2] == 0)
+                comp = [(a.get(NAME) or ("",))[0] or "", enabled, False, False]
+            elif comp and tag in ("action", "category") and NAME in a:
+                v = a[NAME][0] or ""
+                comp[2] |= v == "android.intent.action.MAIN"
+                comp[3] |= v == "android.intent.category.LAUNCHER"
+        else:
+            if stack:
+                stack.pop()
+            if tag in ("activity", "activity-alias") and comp:
+                if not activity and all(comp[1:]) and comp[0]:
+                    activity = comp[0]
+                comp = None
+
+    if activity.startswith("."):
+        activity = pkg + activity
+    elif activity and "." not in activity:
+        activity = pkg + "." + activity
+    print(pkg)
+    print(label)
+    print(activity)
+
+    if icon_out and res and icon_ref:
+        for path in res.files(icon_ref):
+            if path.endswith(".png") and path in apk.namelist():
+                open(icon_out, "wb").write(apk.read(path))
+                return
+            if path.endswith(".xml") and path in apk.namelist():
+                # adaptive icon: use the foreground layer
+                for kind, tag, a in axml(apk.read(path)):
+                    if kind == "start" and tag == "foreground":
+                        ref = next((v for v in a.values() if v[1] == T_REFERENCE), None)
+                        for fg in res.files(ref[2]) if ref else []:
+                            if fg.endswith(".png") and fg in apk.namelist():
+                                open(icon_out, "wb").write(apk.read(fg))
+                                return
+
+
+if __name__ == "__main__":
+    main()

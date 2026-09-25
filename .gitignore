@@ -83,3 +83,13 @@ _agent_*
 *.pem
 *.key
 *.gpg
+
+# konkr-android binaries (Google apps, Lepton-derived framework): build-payload.sh / framework/build-framework.sh
+/external-and-mods/konkr-android/.cache/
+/external-and-mods/konkr-android/payload/**/*.apk
+/external-and-mods/konkr-android/payload/lepton-*/
+/external-and-mods/konkr-android/payload/common/system/product/etc/
+/external-and-mods/konkr-android/payload/common/system/system_ext/etc/
+
+# Decky loader binary (downloaded by apply-overlays)
+/external-and-mods/Decky/loader/

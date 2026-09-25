@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Split-APK bundles, opened by konkr-apk (Lepton). Plain .apk is
+     application/vnd.android.package-archive from freedesktop.org.xml. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-apkm">
+    <comment>Android app bundle (APKMirror)</comment>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="application-vnd.android.package-archive"/>
+    <glob pattern="*.apkm" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-xapk">
+    <comment>Android app bundle (XAPK)</comment>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="application-vnd.android.package-archive"/>
+    <glob pattern="*.xapk" weight="60"/>
+  </mime-type>
+  <mime-type type="application/x-apks">
+    <comment>Android app bundle (APKS)</comment>
+    <sub-class-of type="application/zip"/>
+    <generic-icon name="application-vnd.android.package-archive"/>
+    <glob pattern="*.apks" weight="60"/>
+  </mime-type>
+</mime-info>

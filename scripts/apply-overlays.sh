@@ -464,11 +464,38 @@ chown -R root:root "$R/usr/share/alsa/ucm2/Qualcomm/sm8650" "$R/usr/share/alsa/u
 chmod 0755 "$R/usr/lib/steamos/sm8550-audio-setup" "$R/usr/lib/konkr/konkrd" \
   "$R/usr/bin/konkrctl" "$R/usr/bin/konkr-game" "$R/usr/lib/konkr/konkr-standby" \
   "$R/usr/lib/konkr/konkr-volume" "$R/usr/lib/konkr/konkr-sleep" \
-  "$R/usr/lib/konkr/konkr-suspend" "$R/usr/lib/konkr/konkr-focusfix"
+  "$R/usr/lib/konkr/konkr-suspend" "$R/usr/lib/konkr/konkr-focusfix" \
+  "$R/usr/bin/konkr-apk" "$R/usr/lib/konkr/apk-info"
 # Game mode: re-activate the game after Quick Access / Steam menu closes.
 mkdir -p "$R/usr/lib/systemd/user/gamescope-session.target.wants"
 ln -sfn ../konkr-focusfix.service \
   "$R/usr/lib/systemd/user/gamescope-session.target.wants/konkr-focusfix.service"
+# Android apps (konkr-apk + Lepton): .apk/.apkm/.xapk/.apks open in it, and
+# ~/Android/Inbox auto-installs. /etc links vanish under the /etc overlay.
+mkdir -p "$R/usr/lib/systemd/user/default.target.wants"
+ln -sfn ../konkr-apk-inbox.path \
+  "$R/usr/lib/systemd/user/default.target.wants/konkr-apk-inbox.path"
+# First login adds a Google Play Store title.
+ln -sfn ../konkr-android-setup.service \
+  "$R/usr/lib/systemd/user/default.target.wants/konkr-android-setup.service"
+# Lepton rootfs overlays: Play Store, keyboard, pad layout, framework fixes
+# (external-and-mods/konkr-android; binaries are fetched/built, not in git).
+KAPAY="${ROOT}/external-and-mods/konkr-android/payload"
+if [[ -f "$KAPAY/common/system/product/priv-app/Phonesky/Phonesky.apk" ]]; then
+  rm -rf "$R/usr/share/konkr-android"
+  mkdir -p "$R/usr/share/konkr-android"
+  # exFAT/macOS leave ._* AppleDouble files; a ._x.apk breaks PackageManager.
+  rsync -a --no-owner --no-group --exclude '._*' --exclude '.DS_Store' "$KAPAY/" "$R/usr/share/konkr-android/"
+  chown -R root:root "$R/usr/share/konkr-android"
+  find "$R/usr/share/konkr-android" -type d -exec chmod 0755 {} +
+  find "$R/usr/share/konkr-android" -type f -exec chmod 0644 {} +
+  # Valve's prebaked dalvik-cache files are 0755; keep ours the same.
+  find "$R/usr/share/konkr-android" -path '*/data/dalvik-cache/*' -type f -exec chmod 0755 {} +
+else
+  log "WARN: no konkr-android payload (external-and-mods/konkr-android/build-payload.sh); Android apps will lack the Play Store and fixes"
+fi
+chroot "$R" update-mime-database /usr/share/mime
+chroot "$R" update-desktop-database -q /usr/share/applications
 # Opt-in s2idle (konkrctl sleep s2idle): konkr-sleep.service prepares
 # Wi-Fi/touch/audio/wake sources. Default sleep is konkr-standby.
 mkdir -p "$R/usr/lib/systemd/system/sleep.target.wants"
@@ -493,6 +520,9 @@ if [[ -d "$R/var/lib/overlays/etc/upper" ]]; then
     "$R/var/lib/overlays/etc/upper/systemd/system/multi-user.target.wants/konkrd.service"
   # MCU link is on by default (verified on the Pocket FIT: Quick Access and
   # Performance buttons, stick RGB). konkrctl mcu disable re-blacklists it.
+  # The build rootfs is reused across builds, so drop a blacklist left by
+  # testing `konkrctl mcu disable` — v1.0/v1.1 shipped with the buttons dead.
+  rm -f "$R/etc/modprobe.d/konkr-mcu.conf" "$R/var/lib/overlays/etc/upper/modprobe.d/konkr-mcu.conf"
   cp -f "$SM8650_OVL/etc/konkrd.conf" "$R/var/lib/overlays/etc/upper/konkrd.conf"
   mkdir -p "$R/var/lib/overlays/etc/upper/systemd/coredump.conf.d"
   cp -f "$SM8650_OVL/etc/systemd/coredump.conf.d/10-konkr-sd.conf" \
@@ -588,6 +618,25 @@ mkdir -p "$HOME_DST"
 # .local/lib/liblsfg-vk.so is a link to the SM8550 builder's host library;
 # skip it (decky-lsfg-vk installs its own copy).
 rsync -a --copy-links --exclude '.local/lib/liblsfg-vk.so' "${MOD}/Decky/Plug-ins/" "$HOME_DST/"
+# Decky itself. Upstream left it to a first-boot installer in ARM-Manager
+# that most people never found — no Decky, so no KONKR Control either.
+DECKY_VERSION=v3.2.9
+DECKY_LOADER="${MOD}/Decky/loader/PluginLoader-${DECKY_VERSION}"
+if [[ ! -s "$DECKY_LOADER" ]]; then
+  mkdir -p "${DECKY_LOADER%/*}"
+  curl -fL -o "$DECKY_LOADER.part" \
+    "https://github.com/SteamDeckHomebrew/decky-loader/releases/download/${DECKY_VERSION}/PluginLoader" &&
+    mv "$DECKY_LOADER.part" "$DECKY_LOADER"
+fi
+[[ -s "$DECKY_LOADER" ]] || die "Decky loader ${DECKY_VERSION} missing and download failed"
+mkdir -p "$HOME_DST/homebrew/services" "$HOME_DST/homebrew/settings" "$HOME_DST/homebrew/data" "$HOME_DST/homebrew/logs"
+# ~/.cache must exist (user-owned, see chown below) before anything running
+# as root with HOME=/home/steamos can create it root-owned.
+mkdir -p "$HOME_DST/.cache"
+install -m0755 "$DECKY_LOADER" "$HOME_DST/homebrew/services/PluginLoader"
+printf '%s' "$DECKY_VERSION" >"$HOME_DST/homebrew/services/.loader.version"
+mkdir -p "$R/usr/lib/systemd/system/multi-user.target.wants"
+ln -sfn ../plugin_loader.service "$R/usr/lib/systemd/system/multi-user.target.wants/plugin_loader.service"
 # Fix lsfg-vk home paths
 if [[ -f "$HOME_DST/.config/lsfg-vk/conf.toml" ]]; then
   sed -i 's|/home/steam/|/home/steamos/|g' "$HOME_DST/.config/lsfg-vk/conf.toml"
@@ -674,6 +723,11 @@ if [[ ! -f "$R/usr/lib/qt6/plugins/plasma/kcms/systemsettings_qwidgets/kcm_netwo
   "${SCRIPT_DIR}/build-plasma-nm-6.2.5.sh" "$R" \
     || die "plasma-nm 6.2.5 is required (Network Manager)"
 fi
+if [[ ! -x "$R/usr/bin/plasma-keyboard" ]]; then
+  log "== plasma-keyboard 0.1.0 (desktop touch keyboard)"
+  "${SCRIPT_DIR}/build-plasma-keyboard.sh" "$R" \
+    || die "plasma-keyboard is required (Desktop Mode touch keyboard)"
+fi
 # extras skip ALARM Gear (Qt_6.11). Build official 26.04.2 for Qt 6.8.
 needs_gear_qt68() {
   local bin="$R/usr/bin/$1"
@@ -723,6 +777,9 @@ fi
 # SteamOS empty-password user stays as extracted (steamos:: in shadow)
 
 # ldconfig cache is arch-specific; skip. Dynamic linker will still find /usr/lib.
+
+# Empty mount points the bwrap builds (gamescope/box64) leave in the rootfs.
+rmdir "$R/src/box64" "$R/src/gamescope" "$R/src" "$R/build-parent" 2>/dev/null || true
 
 log "== summary"
 {

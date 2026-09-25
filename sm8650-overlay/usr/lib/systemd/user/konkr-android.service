@@ -1,0 +1,8 @@
+[Unit]
+Description=Android (Lepton) for konkr-apk apps
+
+[Service]
+ExecStart=/usr/bin/konkr-apk daemon
+# SIGTERM only to konkr-apk, which has Lepton kill its container cleanly.
+KillMode=mixed
+TimeoutStopSec=30

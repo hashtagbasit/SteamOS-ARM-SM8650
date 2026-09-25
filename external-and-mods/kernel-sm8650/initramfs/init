@@ -1,9 +1,12 @@
 #!/bin/busybox sh
-# Boot initramfs for SteamOS-ARM-SM8650. Mounts the SD root, leaves the
-# kernel log from this boot in bootlog.txt on the FAT boot partition (the
-# only way to diagnose a black screen without a serial console), then
-# switch_roots. konkr.bootlog_wait=N on the cmdline adds N extra 4-second
-# log snapshots before booting (debugging display/driver bring-up).
+# Boot initramfs for SteamOS-ARM-SM8650. Mounts the root, leaves the kernel
+# log from this boot in bootlog.txt on the FAT boot partition (the only way
+# to diagnose a black screen without a serial console), then switch_roots.
+# konkr.bootlog_wait=N on the cmdline adds N extra 4-second log snapshots
+# before booting (debugging display/driver bring-up).
+#
+# Root: root=PARTLABEL=<name> (internal UFS install: STORAGE, boot log on
+# ROCKNIX); anything else is the microSD image (p1 boot, p2 root).
 /bin/busybox --install -s /bin
 export PATH=/bin
 mount -t devtmpfs dev /dev
@@ -12,17 +15,47 @@ mount -t sysfs sys /sys
 mkdir -p /boot /newroot
 
 extra=0
+rootarg=""
 for arg in $(cat /proc/cmdline); do
-  case "$arg" in konkr.bootlog_wait=*) extra="${arg#*=}" ;; esac
+  case "$arg" in
+    konkr.bootlog_wait=*) extra="${arg#*=}" ;;
+    root=*) rootarg="${arg#root=}" ;;
+  esac
 done
 
-bootdev=""
-for i in $(seq 1 60); do
-  for p in /sys/class/block/mmcblk*p1; do
-    [ -e "$p" ] && bootdev="/dev/$(basename "$p")" && break 2
+# /dev node of the partition with GPT name $1, if present.
+by_partlabel() {
+  for u in /sys/class/block/*/uevent; do
+    if grep -qx "PARTNAME=$1" "$u"; then
+      d="${u%/uevent}"
+      echo "/dev/${d##*/}"
+      return 0
+    fi
   done
-  sleep 0.5
-done
+  return 1
+}
+
+bootdev=""
+rootdev=""
+case "$rootarg" in
+  PARTLABEL=*)
+    # UFS comes up a few seconds into boot.
+    for i in $(seq 1 60); do
+      rootdev="$(by_partlabel "${rootarg#PARTLABEL=}")" && break
+      sleep 0.5
+    done
+    bootdev="$(by_partlabel ROCKNIX)"
+    ;;
+  *)
+    for i in $(seq 1 60); do
+      for p in /sys/class/block/mmcblk*p1; do
+        [ -e "$p" ] && bootdev="/dev/$(basename "$p")" && break 2
+      done
+      sleep 0.5
+    done
+    [ -n "$bootdev" ] && rootdev="${bootdev%p1}p2"
+    ;;
+esac
 
 snap() {
   [ -n "$bootdev" ] || return
@@ -41,8 +74,7 @@ if [ -n "$bootdev" ] && mount -t vfat "$bootdev" /boot; then
   while [ "$n" -lt "$extra" ]; do snap "snapshot $n"; sleep 4; n=$((n + 1)); done
 fi
 
-rootdev="${bootdev%p1}p2"
-if [ -n "$bootdev" ] && mount -t ext4 -o rw "$rootdev" /newroot; then
+if [ -n "$rootdev" ] && mount -t ext4 -o rw "$rootdev" /newroot; then
   snap "root mounted from $rootdev, switch_root"
   umount /boot 2>/dev/null
   exec switch_root /newroot /sbin/init

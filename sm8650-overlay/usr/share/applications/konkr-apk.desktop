@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Install Android App
+Comment=Install an Android app and add it to Steam
+Exec=/usr/bin/konkr-apk install %F
+Icon=application-vnd.android.package-archive
+MimeType=application/vnd.android.package-archive;application/x-apkm;application/x-xapk;application/x-apks;
+NoDisplay=true
+Terminal=false

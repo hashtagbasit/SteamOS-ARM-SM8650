@@ -1,0 +1,9 @@
+[Unit]
+Description=Install Android apps dropped into ~/Android/Inbox
+
+[Path]
+DirectoryNotEmpty=%h/Android/Inbox
+MakeDirectory=yes
+
+[Install]
+WantedBy=default.target

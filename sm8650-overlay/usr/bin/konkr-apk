@@ -1,0 +1,576 @@
+#!/bin/bash
+# konkr-apk — Android apps on SteamOS through Lepton (Valve's Android layer,
+# Steam app 3029110; needs the binder kernel from steamos.config).
+#
+#   konkr-apk install FILE...  .apk / .apkm / .xapk / .apks (split bundles
+#                              too). Opening one in Dolphin does the same.
+#   konkr-apk run PACKAGE      open an app (what its Steam title calls)
+#   konkr-apk store            open the Play Store
+#   konkr-apk list             installed apps
+#   konkr-apk remove PACKAGE   uninstall (delete its Steam title by hand)
+#   konkr-apk inbox            install everything in ~/Android/Inbox
+#   konkr-apk stop             shut Android down
+#
+# All apps share one Android (konkr-android.service, started on demand and
+# stopped 10 minutes after the last app closes). Every app installed in it —
+# sideloaded or from the Play Store — gets its own Steam title with its name
+# and icon. Lepton is presented a Steam launch without an APK
+# (SteamAppId=konkr-android), which keeps /data between runs.
+set -euo pipefail
+
+LEPTON_APPID=3029110
+LEPTON_DIR="${HOME}/.local/share/Steam/steamapps/common/Lepton"
+LEPTON="${LEPTON_DIR}/lepton"
+APPS="${HOME}/Android"
+INBOX="${APPS}/Inbox"
+SYS="${APPS}/.android"            # shared Android: data, icons, known titles
+CTR=lepton-steamlaunch-konkr-android
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+READY="${RUNDIR}/konkr-android.ready"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+APK_INFO=/usr/lib/konkr/apk-info
+OVERLAY_ROOT=/usr/share/konkr-android
+# Launchable system apps that get a Steam title too.
+SYSTEM_TITLES=(com.android.vending)
+# Touch keyboard shipped in the overlay (Simple Keyboard, F-Droid).
+IME=rkr.simplekeyboard.inputmethod/.latin.LatinIME
+
+say() {
+  echo "konkr-apk: $*" >&2
+  notify-send -a "Android apps" -i android-package-archive "Android apps" "$*" 2>/dev/null || true
+}
+die() { say "$*"; exit 1; }
+
+ensure_lepton() {
+  [[ -x "$LEPTON" ]] && return 0
+  say "Downloading the Android runtime (Lepton) through Steam…"
+  steam "steam://install/${LEPTON_APPID}" >/dev/null 2>&1 &
+  local i
+  for ((i = 0; i < 360; i++)); do
+    [[ -x "$LEPTON" ]] && sleep 20 && return 0  # let Steam finish the depot
+    sleep 5
+  done
+  die "Lepton didn't finish installing. Check Steam's Downloads page, then try again."
+}
+
+# Idempotent edits to Steam's Lepton, re-applied every start since Steam
+# updates overwrite the tool.
+patch_lepton() {
+  python3 - "${LEPTON_DIR}" <<'EOF'
+import sys, pathlib
+root = pathlib.Path(sys.argv[1])
+def patch(name, old, new):
+    f = root / name
+    s = f.read_text()
+    if new in s:
+        return
+    if old not in s:
+        print(f"konkr-apk: WARN {name} changed upstream, patch skipped", file=sys.stderr)
+        return
+    f.write_text(s.replace(old, new, 1))
+
+# A Steam launch without an APK boots straight to Android (like `dev`), but
+# keeps its data like a Steam game.
+patch("lepton",
+      '        if ! is_steamlaunch && ! is_app; then\n            continue_boot_after_bake\n',
+      '        # konkr-apk: shared Android without an app\n'
+      '        if ! is_app; then\n            continue_boot_after_bake\n')
+
+patch("lepton",
+      '        if is_steamlaunch || [[ "${LEPTON_CONTEXT}" == *.apk ]]; then\n'
+      '            if [[ -z "${APP_PACKAGE_ID}" ]]; then\n',
+      '        # konkr-apk: shared Android has no APK\n'
+      '        if { is_steamlaunch && is_app; } || [[ "${LEPTON_CONTEXT}" == *.apk ]]; then\n'
+      '            if [[ -z "${APP_PACKAGE_ID}" ]]; then\n')
+
+# Per-app persistent data only makes sense with an app (an empty app id
+# would move the whole compat dir into itself).
+patch("liblepton/mounting.sh",
+      '    if [[ -d "${STEAM_COMPAT_DATA_PATH:-}" ]]; then\n'
+      '        PERSISTENT_DATA_PATH=',
+      '    # konkr-apk: shared Android has no app id\n'
+      '    if [[ -d "${STEAM_COMPAT_DATA_PATH:-}" && -n "$(get_app_id)" ]]; then\n'
+      '        PERSISTENT_DATA_PATH=')
+
+# Gamepads: the host's live /dev/input, which konkr-apk links pads from
+# (Waydroid only forwards touch/keyboard/mouse from Wayland). Steam
+# recreates its virtual pads, so per-node mounts would go stale.
+patch("liblepton/mounting.sh",
+      '    # By default, we do not allow writes to msg\n',
+      '    # konkr-apk: host input devices\n'
+      '    if [[ -n "${KONKR_LEPTON_OVERLAY:-}" ]]; then\n'
+      '        podman_mount_entry /dev/input /dev/host-input ro\n'
+      '    fi\n\n'
+      '    # By default, we do not allow writes to msg\n')
+
+# LuaJIT (xLua/ToLua in many Unity games) needs memory below 2^47, but our
+# 48-bit+ VA kernel maps top-down from 2^48 and lua_newstate returns NULL.
+# An unlimited stack rlimit selects the legacy bottom-up layout (from 2^46);
+# zygote inherits it and every app forks from zygote. Phones use 39-bit VA.
+patch("liblepton/mounting.sh",
+      '    # namespaces\n',
+      '    # namespaces\n'
+      '    # konkr-apk: low mmap layout for LuaJIT\n'
+      '    if [[ -n "${KONKR_LEPTON_OVERLAY:-}" ]]; then\n'
+      '        podman_cmdline --ulimit stack=-1:-1\n'
+      '    fi\n')
+
+# Extra rootfs overlay (restored framework services, Play Store); Steam's
+# own Android games keep Valve's image.
+patch("liblepton/mounting.sh",
+      '    for OVERLAY in ${LEPTON_OVERLAY} ${GUESTOS_OVERLAY}; do\n',
+      '    # konkr-apk: extra overlay\n'
+      '    for OVERLAY in ${LEPTON_OVERLAY} ${GUESTOS_OVERLAY} ${KONKR_LEPTON_OVERLAY:-}; do\n')
+EOF
+}
+
+# Lepton mounts SteamVR's runtime/config/log dirs (from openvrpaths.vrpath)
+# into every container. There's no SteamVR here: point them at empty dirs,
+# unless a real SteamVR registered itself.
+ensure_vrpaths() {
+  local vrp="${HOME}/.config/openvr/openvrpaths.vrpath" base="${HOME}/.local/share/konkr-apk/steamvr"
+  [[ -s "$vrp" ]] && return 0
+  mkdir -p "${vrp%/*}" "$base/runtime" "$base/config" "$base/logs"
+  cat >"$vrp" <<EOF
+{
+  "config": ["$base/config"],
+  "external_drivers": null,
+  "jsonid": "vrpathreg",
+  "log": ["$base/logs"],
+  "runtime": ["$base/runtime"],
+  "version": 1
+}
+EOF
+}
+
+# Steam's virtual pads when Steam Input is active (Game Mode), otherwise the
+# physical ones — never both, or every press lands twice.
+gamepad_nodes() {
+  local virt=() phys=() ev sys
+  for sys in /sys/class/input/event*; do
+    ev="${sys##*/}"
+    [[ -r "/dev/input/${ev}" ]] || continue
+    udevadm info -q property -n "/dev/input/${ev}" 2>/dev/null | grep -qx 'ID_INPUT_JOYSTICK=1' || continue
+    if [[ "$(readlink -f "${sys}/device")" == /sys/devices/virtual/* ]]; then
+      virt+=("$ev")
+    else
+      phys+=("$ev")
+    fi
+  done
+  if ((${#virt[@]})); then echo "${virt[*]}"; else echo "${phys[*]}"; fi
+}
+
+# App id of the Steam launch we're running under (the reaper's
+# "SteamLaunch AppId=N"), the same way gamescope finds a window's app.
+steam_launch_appid() {
+  local pid=$$ comm args
+  while ((pid > 1)); do
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || break
+    if [[ "$comm" == reaper ]]; then
+      args="$(tr '\0' '\n' <"/proc/$pid/cmdline")"
+      grep -qx SteamLaunch <<<"$args" && sed -n 's/^AppId=\([0-9]\+\)$/\1/p' <<<"$args" | head -n1
+      return 0
+    fi
+    pid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)" || break
+  done
+  return 0
+}
+
+# Shell command inside Android. Stdin is passed through (APK streaming).
+asx() { podman exec -i "$CTR" /system/bin/sh -c "$1" 2>/dev/null; }
+
+android_up() { [[ -f "$READY" ]] && systemctl --user -q is-active konkr-android.service; }
+
+# Which Wayland display Android should draw on: gamescope in Game Mode,
+# KWin in Desktop Mode.
+current_display() {
+  if [[ -e "${RUNDIR}/gamescope-0" ]]; then echo gamescope-0; else echo "${WAYLAND_DISPLAY:-wayland-0}"; fi
+}
+
+ensure_android() {
+  local want i
+  want="$(current_display)"
+  if android_up && [[ "$(cat "$READY")" == "$want" ]]; then
+    return 0
+  fi
+  # Switched between Game and Desktop Mode: the window lives on the old one.
+  systemctl --user stop konkr-android.service 2>/dev/null || true
+  systemctl --user set-environment KONKR_ANDROID_DISPLAY="$want"
+  systemctl --user start konkr-android.service
+  say "Starting Android…"
+  for ((i = 0; i < 120; i++)); do
+    android_up && return 0
+    systemctl --user -q is-active konkr-android.service || break
+    sleep 2
+  done
+  die "Android didn't start (journalctl --user -u konkr-android)."
+}
+
+# Rootfs overlays for Lepton (see external-and-mods/konkr-android):
+#  common/        Play Store + Play services, touch keyboard, Steam pad key
+#                 layout, no freeform windows
+#  lepton-<ver>/  services.jar with the SystemServer services Lepton strips
+#                 (clipboard, biometric/auth, cross-profile apps, …) and the
+#                 odex/dalvik-cache built against it. Tied to one Lepton
+#                 Android image: skipped for any other version, which then
+#                 boots stock (apps relying on those services may crash).
+overlay_dirs() {
+  local ver dirs=("${OVERLAY_ROOT}/common")
+  ver="$(cat "${LEPTON_DIR}/images/version.txt" 2>/dev/null || true)"
+  if [[ -d "${OVERLAY_ROOT}/lepton-${ver}" ]]; then
+    dirs+=("${OVERLAY_ROOT}/lepton-${ver}")
+  else
+    say "Lepton's Android image (${ver:-unknown}) is newer than this build's framework fixes; some apps may crash."
+  fi
+  echo "${dirs[*]}"
+}
+
+# --- titles -----------------------------------------------------------------
+
+add_title() {
+  local pkg="$1" path apk meta label activity desktop icon="${SYS}/icons/${pkg}.png"
+  path="$(asx "pm path $pkg" | sed -n 's/^package://p' | grep -m1 '\.apk$' || true)"
+  [[ -n "$path" ]] || return 0
+  # Read it through Android: installs aren't reliably visible in the host
+  # side of Lepton's /data overlay.
+  apk="$(mktemp --suffix=.apk)"
+  asx "cat '$path'" >"$apk" || true
+  mkdir -p "${SYS}/icons"
+  mapfile -t meta < <(python3 "$APK_INFO" "$apk" "$icon" 2>/dev/null || true)
+  rm -f "$apk"
+  activity="${meta[2]:-}"
+  [[ -n "$activity" ]] || return 0   # nothing to open (services, libraries)
+  label="${meta[1]:-$pkg}"
+  [[ -f "$icon" ]] || icon=android-package-archive
+  desktop="${DESKTOP_DIR}/konkr-android-${pkg}.desktop"
+  mkdir -p "$DESKTOP_DIR"
+  cat >"$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${label}
+Comment=Android app (${pkg})
+Exec=/usr/bin/konkr-apk run ${pkg}
+Icon=${icon}
+Categories=Game;
+EOF
+  grep -qx "$pkg" "${SYS}/titles" 2>/dev/null && return 0
+  if steam_add "$desktop" "$pkg"; then
+    echo "$pkg" >>"${SYS}/titles"
+    say "${label} added to your Steam library."
+  fi
+  return 0
+}
+
+# Is there a Steam shortcut for this package? Steam stores a .desktop add
+# as exe "/usr/bin/konkr-apk", LaunchOptions '"run" "<pkg>"' and the
+# .desktop as ShortcutPath.
+steam_has() {
+  grep -qaF -e "\"run\" \"$1\"" -e "konkr-android-$1.desktop" \
+    "${HOME}"/.local/share/Steam/userdata/*/config/shortcuts.vdf 2>/dev/null
+}
+
+# Add a shortcut and confirm Steam actually took it. steamos-add-to-steam
+# only hands Steam a steam:// URL and always succeeds; before the user has
+# signed in and the library is up (first boot) Steam drops it silently.
+steam_add() {
+  local desktop="$1" pkg="$2" i
+  steam_has "$pkg" && return 0
+  pgrep -x steam >/dev/null 2>&1 || return 1
+  compgen -G "${HOME}/.local/share/Steam/userdata/[1-9]*/config/localconfig.vdf" >/dev/null || return 1
+  steamos-add-to-steam "$desktop" >/dev/null 2>&1 || return 1
+  for ((i = 0; i < 15; i++)); do
+    sleep 2
+    steam_has "$pkg" && return 0
+  done
+  return 1
+}
+
+# New apps get a title, uninstalled ones lose their desktop entry.
+sync_titles() {
+  local pkgs pkg f
+  pkgs="$(asx "pm list packages -3" | sed -n 's/^package://p' || true)"
+  [[ -n "$pkgs" ]] || pkgs=""
+  pkgs+=$'\n'"$(printf '%s\n' "${SYSTEM_TITLES[@]}")"
+  # Keyboards have a settings screen but aren't something to launch.
+  pkgs="$(grep -vxF -f <(asx "ime list -a -s" | cut -d/ -f1 || true) <<<"$pkgs" || true)"
+  for pkg in $pkgs; do
+    [[ -f "${DESKTOP_DIR}/konkr-android-${pkg}.desktop" ]] || add_title "$pkg"
+  done
+  for f in "${DESKTOP_DIR}"/konkr-android-*.desktop; do
+    [[ -f "$f" ]] || continue
+    pkg="${f##*/konkr-android-}"; pkg="${pkg%.desktop}"
+    grep -qx "$pkg" <<<"$pkgs" || rm -f "$f"
+  done
+  update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+}
+
+# Link the current pads into Android's /dev/input. EventHub watches that
+# dir for create/delete, so relinking whenever a node changes (Steam
+# recreates its virtual pad per launch) acts as a hot-plug.
+PADS=""
+sync_pads() {
+  local ev want="" cmd="rm -f /dev/input/event*;"
+  for ev in $(gamepad_nodes); do
+    want+="${ev}:$(stat -c %i "/dev/input/${ev}") "
+    cmd+=" ln -s /dev/host-input/${ev} /dev/input/${ev};"
+  done
+  [[ "$want" == "$PADS" ]] && return 0
+  asx "$cmd" && PADS="$want"
+}
+
+# --- commands ---------------------------------------------------------------
+
+# konkr-android.service body.
+cmd_daemon() {
+  ensure_lepton
+  patch_lepton
+  ensure_vrpaths
+  mkdir -p "${SYS}/app" "${SYS}/data" "${SYS}/shadercache/fozpipelinesv6"
+  touch "${SYS}/app/lepton-show-flatscreen"
+  rm -f "$READY"
+
+  export SteamAppId=konkr-android
+  export STEAM_COMPAT_INSTALL_PATH="${SYS}/app"
+  export STEAM_COMPAT_CLIENT_INSTALL_PATH="${HOME}/.local/share/Steam"
+  export STEAM_COMPAT_DATA_PATH="${SYS}/data"
+  export STEAM_COMPAT_LIBRARY_PATHS="${SYS}"
+  export STEAM_COMPAT_SHADER_PATH="${SYS}/shadercache"
+  export STEAM_FOSSILIZE_DUMP_PATH="${SYS}/shadercache/fozpipelinesv6/steamapp_pipeline_cache"
+  # Never let Lepton wipe the shared /data (it does on "early exit").
+  export LEPTON_NO_CLEANUP=true
+  export GAMESCOPE_WAYLAND_DISPLAY="${KONKR_ANDROID_DISPLAY:-$(current_display)}"
+  export KONKR_LEPTON_OVERLAY="$(overlay_dirs)"
+
+  "$LEPTON" waitforexitandrun &
+  local lepton_pid=$! i
+  trap 'rm -f "$READY"; kill -TERM "$lepton_pid" 2>/dev/null; wait "$lepton_pid"; exit 0' TERM INT
+
+  for ((i = 0; i < 150; i++)); do
+    [[ "$(asx "getprop sys.boot_completed" || true)" == 1 ]] && break
+    kill -0 "$lepton_pid" 2>/dev/null || exit 1
+    sleep 2
+  done
+  # Lepton ships no keyboard; ours is in the overlay. Android treats the
+  # Wayland keyboard as a hardware one and would hide the touch keyboard.
+  asx 'ime enable '"$IME"'; case "$(settings get secure default_input_method)" in ""|null) ime set '"$IME"';; esac;
+       settings put secure show_ime_with_hard_keyboard 1' >/dev/null || true
+  # No setup wizard runs here, and Android ignores Home ("user setup is in
+  # progress") until setup is marked done. It gets reset, so set it each boot.
+  asx 'settings put secure user_setup_complete 1; settings put global device_provisioned 1' >/dev/null || true
+  echo "$GAMESCOPE_WAYLAND_DISPLAY" >"$READY"
+
+  # Pads every 3 s; titles for apps installed from inside Android (Play
+  # Store, F-Droid…) every 15 s.
+  for ((i = 0; ; i++)); do
+    kill -0 "$lepton_pid" 2>/dev/null || break
+    sync_pads || true
+    ((i % 5)) || sync_titles || true
+    sleep 3 &
+    wait $! || true
+  done
+  rm -f "$READY"
+  wait "$lepton_pid"
+}
+
+# Unpack FILE into DIR as base.apk (+ splits) and obb/.
+unpack() {
+  local src="$1" tmp="$2" f p
+  case "${src,,}" in
+    *.apk)
+      cp "$src" "$tmp/base.apk"
+      ;;
+    *.apkm|*.xapk|*.apks|*.zip)
+      mkdir "$tmp/x"
+      unzip -qq -o "$src" -d "$tmp/x" 2>/dev/null ||
+        7z x -y -bso0 -bsp0 -o"$tmp/x" "$src" ||
+        die "can't unpack $(basename "$src") (older password-protected .apkm files aren't supported)"
+      # Bundletool .apks keep splits under splits/; the rest are flat.
+      while IFS= read -r -d '' f; do cp "$f" "$tmp/"; done \
+        < <(find "$tmp/x" -type f -iname '*.apk' -print0)
+      [[ -f "$tmp/base.apk" || ! -f "$tmp/base-master.apk" ]] || mv "$tmp/base-master.apk" "$tmp/base.apk"
+      if [[ ! -f "$tmp/base.apk" ]]; then
+        # XAPK: base is named <package>.apk
+        p="$(jq -r '.package_name // empty' "$tmp/x/manifest.json" 2>/dev/null || true)"
+        [[ -n "$p" && -f "$tmp/$p.apk" ]] && mv "$tmp/$p.apk" "$tmp/base.apk"
+      fi
+      [[ -f "$tmp/base.apk" ]] || die "no base APK in $(basename "$src")"
+      if [[ -d "$tmp/x/Android/obb" ]]; then
+        mkdir -p "$tmp/obb"
+        find "$tmp/x/Android/obb" -type f -name '*.obb' -exec cp {} "$tmp/obb/" \;
+      fi
+      rm -rf "$tmp/x"
+      ;;
+    *) die "unsupported file: $(basename "$src") (use .apk, .apkm, .xapk or .apks)" ;;
+  esac
+}
+
+# Subshell: die/trap stay local to one file.
+cmd_install() (
+  local src tmp meta pkg apks=() size sid f n=0
+  src="$(realpath -- "$1")"
+  [[ -f "$src" ]] || die "no such file: $1"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  unpack "$src" "$tmp"
+
+  mapfile -t meta < <(python3 "$APK_INFO" "$tmp/base.apk" 2>/dev/null || true)
+  pkg="${meta[0]:-}"
+  [[ "$pkg" =~ ^[A-Za-z0-9_.]+$ ]] || die "can't read the package name from $(basename "$src")"
+
+  ensure_android
+  apks=("$tmp/base.apk")
+  for f in "$tmp"/*.apk; do [[ "$f" == "$tmp/base.apk" ]] || apks+=("$f"); done
+  # Stream into a PackageInstaller session (works for splits too).
+  size=0
+  for f in "${apks[@]}"; do size=$((size + $(stat -c %s "$f"))); done
+  sid="$(asx "pm install-create -r -g -S $size" | sed -n 's/.*\[\([0-9]*\)\].*/\1/p' || true)"
+  [[ -n "$sid" ]] || die "Android refused to install $(basename "$src")"
+  for f in "${apks[@]}"; do
+    asx "pm install-write -S $(stat -c %s "$f") $sid $((n++)).apk -" <"$f" >/dev/null ||
+      die "copying $(basename "$src") into Android failed"
+  done
+  asx "pm install-commit $sid" | grep -q Success || die "Android couldn't install $(basename "$src")"
+  if [[ -d "$tmp/obb" ]]; then
+    asx "mkdir -p /sdcard/Android/obb/$pkg" || true
+    for f in "$tmp"/obb/*.obb; do
+      asx "cat > /sdcard/Android/obb/$pkg/${f##*/}" <"$f" || die "copying $(basename "$f") failed"
+    done
+  fi
+  asx "appops set $pkg REQUEST_INSTALL_PACKAGES allow" >/dev/null || true
+  add_title "$pkg"
+  say "Installed ${meta[1]:-$pkg}."
+)
+
+# KONKR_ANDROID_APPID on gamescope's root window: which Steam title the
+# shared Android window belongs to (0 = none).
+set_window_appid() {
+  [[ -n "${DISPLAY:-}" ]] || return 0
+  xprop -root -f KONKR_ANDROID_APPID 32c -set KONKR_ANDROID_APPID "$1" 2>/dev/null || true
+}
+
+schedule_idle_stop() {
+  systemctl --user stop konkr-android-idle.timer 2>/dev/null || true
+  systemd-run --user --quiet --collect --unit=konkr-android-idle --on-active=600 \
+    /usr/bin/konkr-apk idle-stop >/dev/null 2>&1 || true
+}
+
+cmd_run() {
+  local pkg="$1" comp appid focus gone=0 home=0 f
+  [[ "$pkg" =~ ^[A-Za-z0-9_.]+$ ]] || die "bad package name: $pkg"
+  ensure_android
+  if ! asx "pm path $pkg" | grep -q '^package:'; then
+    # A title from before the shared Android: install its old copy.
+    f="$(compgen -G "${APPS}/${pkg}/base.apk" || true)"
+    [[ -n "$f" ]] || die "${pkg} isn't installed"
+    cmd_install "$f"
+  fi
+  comp="$(asx "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER $pkg" | tail -n1 || true)"
+  [[ "$comp" == */* ]] || die "${pkg} has nothing to open"
+
+  # Tell gamescope the shared Android window belongs to this Steam title.
+  appid="$(steam_launch_appid)"
+  set_window_appid "${appid:-0}"
+  # Toggling "install unknown apps" at runtime kills the app; grant it upfront.
+  asx "appops set $pkg REQUEST_INSTALL_PACKAGES allow; am start -n $comp" >/dev/null || true
+
+  # Steam counts a title as running while it owns a window, so hand the
+  # shared Android window back on the way out or Exit Game never finishes.
+  trap 'set_window_appid 0; asx "am force-stop '"$pkg"'" >/dev/null || true; schedule_idle_stop; exit 0' TERM INT HUP
+  # Stay alive — Steam shows the title as running and keeps feeding the
+  # controller to it — while the user is anywhere in Android (Home, Recents,
+  # other apps). End when Steam's Exit Game kills us, or once the app has
+  # really closed and the Android home screen is up.
+  while android_up; do
+    sleep 3
+    if asx "pidof $pkg" >/dev/null; then gone=0; else gone=$((gone + 1)); fi
+    if ((gone >= 2)); then
+      focus="$(asx "dumpsys window | grep -m1 mCurrentFocus" || true)"
+      if [[ "$focus" == *launcher3* ]]; then home=$((home + 1)); else home=0; fi
+      ((home < 2)) || break
+    fi
+  done
+  set_window_appid 0
+  schedule_idle_stop
+}
+
+# First login: a Play Store title, so there's something to start from.
+# Needs no running Android (the APK ships in the image).
+cmd_setup() {
+  local i desktop="${DESKTOP_DIR}/konkr-android-com.android.vending.desktop" icon="${SYS}/icons/com.android.vending.png"
+  steam_has com.android.vending && return 0
+  mkdir -p "${SYS}/icons" "$DESKTOP_DIR"
+  python3 "$APK_INFO" "${OVERLAY_ROOT}/common/system/product/priv-app/Phonesky/Phonesky.apk" "$icon" >/dev/null 2>&1 || true
+  [[ -f "$icon" ]] || icon=android-package-archive
+  cat >"$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Google Play Store
+Comment=Android app (com.android.vending)
+Exec=/usr/bin/konkr-apk run com.android.vending
+Icon=${icon}
+Categories=Game;
+EOF
+  # First boot: Steam still has to be signed in and show the library. Keep
+  # trying (2 h), and only record the title once Steam really has it.
+  for ((i = 0; i < 360; i++)); do
+    if steam_add "$desktop" com.android.vending; then
+      grep -qx com.android.vending "${SYS}/titles" 2>/dev/null \
+        || echo com.android.vending >>"${SYS}/titles"
+      return 0
+    fi
+    sleep 20
+  done
+  return 1
+}
+
+cmd_idle_stop() {
+  pgrep -f "konkr-apk run " >/dev/null && return 0
+  systemctl --user stop konkr-android.service
+}
+
+cmd_list() {
+  local f pkg
+  for f in "${DESKTOP_DIR}"/konkr-android-*.desktop; do
+    [[ -f "$f" ]] || continue
+    pkg="${f##*/konkr-android-}"
+    printf '%-40s %s\n' "${pkg%.desktop}" "$(sed -n 's/^Name=//p' "$f")"
+  done
+}
+
+cmd_remove() {
+  local pkg="$1"
+  [[ "$pkg" =~ ^[A-Za-z0-9_.]+$ ]] || die "bad package name: $pkg"
+  ensure_android
+  asx "pm uninstall $pkg" | grep -q Success || die "${pkg} isn't installed"
+  rm -f "${DESKTOP_DIR}/konkr-android-${pkg}.desktop" "${SYS}/icons/${pkg}.png"
+  sed -i "/^${pkg//./\\.}\$/d" "${SYS}/titles" 2>/dev/null || true
+  say "Removed ${pkg}. Delete its title from the Steam library by hand."
+}
+
+cmd_inbox() {
+  mkdir -p "$INBOX" "${APPS}/Failed"
+  local f i
+  # Titles need a running Steam (the path unit can fire right at login).
+  for ((i = 0; i < 36 && !$(pgrep -xc steam || true); i++)); do sleep 5; done
+  shopt -s nullglob
+  # Everything leaves the inbox, or DirectoryNotEmpty= re-fires forever.
+  for f in "$INBOX"/*; do
+    # Let copies in progress finish.
+    while (( $(date +%s) - $(stat -c %Y "$f") < 5 )); do sleep 2; done
+    if cmd_install "$f"; then rm -f "$f"; else mv -f "$f" "${APPS}/Failed/"; fi
+  done
+}
+
+case "${1:-}" in
+  install) shift; (($#)) || die "usage: konkr-apk install FILE..."; for f; do cmd_install "$f"; done ;;
+  run) [[ -n "${2:-}" ]] || die "usage: konkr-apk run PACKAGE"; cmd_run "$2" ;;
+  store) cmd_run com.android.vending ;;
+  list) cmd_list ;;
+  remove) [[ -n "${2:-}" ]] || die "usage: konkr-apk remove PACKAGE"; cmd_remove "$2" ;;
+  inbox) cmd_inbox ;;
+  stop) systemctl --user stop konkr-android.service ;;
+  daemon) cmd_daemon ;;
+  idle-stop) cmd_idle_stop ;;
+  setup) cmd_setup ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

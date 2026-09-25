@@ -46,11 +46,14 @@ if grep -qiE 'APS2|SM8650' /proc/asound/cards; then
   log "SM8650 card ${card_id}: $(tr '\n' ' ' </proc/asound/cards 2>/dev/null)"
   if ucm SM8650-APS2 || ucm "hw:${card_id}"; then
     log "alsaucm SM8650-APS2 HiFi Speaker ok"
-    # Speaker levels. PA at the Qualcomm reference (alsa-ucm-conf
-    # wsa884x/two-speakers): 12 = +9 dB. The WSA digital stage starts at its
+    # Speaker levels. The PA control's TLV label is misleading: the register
+    # is inverted over 0..31 while the chip's gain table runs 0 = +21 dB ..
+    # 18 = -6 dB, so "12" (+9 dB on the label) was really about -7.5 dB and
+    # the speakers were far too quiet. 17 = G_0_DB, the cap the sc8280xp
+    # machine driver itself enforces. The WSA digital stage starts at its
     # max; konkr-volume then drives it from Steam's bar with a usable curve
     # in hardware (attenuating the S16-only PCM in software crackled).
-    amixer -c "$card_id" cset name='Speakers Volume' 12,12 >/dev/null 2>&1
+    amixer -c "$card_id" cset name='Speakers Volume' 17,17 >/dev/null 2>&1
     amixer -c "$card_id" cset name='WSA_RX0 Digital Volume' 100% >/dev/null 2>&1
     amixer -c "$card_id" cset name='WSA_RX1 Digital Volume' 100% >/dev/null 2>&1
   else

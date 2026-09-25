@@ -58,7 +58,10 @@ UI_COMMS = {"gamescope-wl", "Xwayland", "steam", "steamwebhelper",
             "gamescopereaper", "mangoapp", "inputplumber",
             # Desktop Mode: same problem, compositor + shell on the A520s
             "kwin_wayland", "kwin_x11", "plasmashell", "krunner",
-            "konsole", "dolphin", "plasma-discover", "systemsettings"}
+            "konsole", "dolphin", "plasma-discover", "systemsettings",
+            # Discover installs: the pull, the checksumming and the deploy
+            # (comm is truncated to 15 chars)
+            "flatpak", "flatpak-system-", "flatpak-session", "ostree"}
 UI_UCLAMP = {"silent": 128, "balanced": 200, "turbo": 300}
 # Disk priority (BFQ honours it). The microSD does ~1.6 MB/s of 4K writes;
 # a Steam download from the `steam` client process must not queue ahead of
@@ -542,6 +545,29 @@ def steam_url(url: str) -> None:
                      env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+PROFILE_LABEL = {"silent": "Silent", "balanced": "Balanced", "turbo": "Turbo"}
+
+
+def notify_desktop(title: str, body: str) -> None:
+    """Desktop Mode popup for button presses. Game Mode gets a Steam toast
+    from the KONKR Control plugin instead, so only notify while Plasma runs."""
+    import pwd
+    import subprocess
+    if subprocess.run(["pgrep", "-x", "plasmashell"], stdout=subprocess.DEVNULL).returncode != 0:
+        return
+    try:
+        uid = pwd.getpwnam("steamos").pw_uid
+    except KeyError:
+        return
+    env = {"HOME": "/home/steamos", "USER": "steamos", "PATH": "/usr/bin:/bin",
+           "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus"}
+    subprocess.Popen(["runuser", "-u", "steamos", "--", "notify-send", "-a", "KONKR",
+                      "-i", "preferences-system-power", "-t", "2000",
+                      "-h", "string:x-canonical-private-synchronous:konkr-mode", title, body],
+                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class Hotkeys:
     def __init__(self):
         self.fds: dict[int, str] = {}
@@ -619,15 +645,18 @@ class Daemon:
             self.st["profile"] = PROFILES[(i + 1) % len(PROFILES)]
             save_state(self.st)
             self.apply_profile()
+            notify_desktop(PROFILE_LABEL[self.st["profile"]], "Performance profile")
         elif name in ("profile-silent", "profile-balanced", "profile-turbo"):
             self.st["profile"] = name.split("-", 1)[1]
             save_state(self.st)
             self.apply_profile()
+            notify_desktop(PROFILE_LABEL[self.st["profile"]], "Performance profile")
         elif name == "fan-boost":
             self.st["fan"]["boost"] = not self.st["fan"].get("boost")
             save_state(self.st)
             self.leds.flash((255, 255, 255) if self.st["fan"]["boost"] else (60, 60, 60))
             log(f"fan boost {'on' if self.st['fan']['boost'] else 'off'}")
+            notify_desktop("Fan boost " + ("on" if self.st["fan"]["boost"] else "off"), "")
         elif name == "sticks-toggle":
             rgb = self.st["rgb"]
             if rgb.get("mode") == "off":

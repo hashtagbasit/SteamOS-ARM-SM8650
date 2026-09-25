@@ -1,0 +1,6 @@
+[Unit]
+Description=Install Android apps from ~/Android/Inbox
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/konkr-apk inbox

@@ -18,7 +18,12 @@ audible crackle/grit that got worse the lower it went. softVolumes stay at
     bar   1 %   5 %  10 %  20 %  30 %  50 %  75 %  100 %
     dB  -33.5 -31.7 -29.5 -25.2 -21.0 -13.3 -5.2    0
 
-The amplifier (PA) stays at the Qualcomm reference, set by sm8550-audio-setup.
+The amplifier (PA) is held at 17 = the chip's G_0_DB step (the control's
+TLV label says +16.5 dB, but the register is inverted over 0..31 while the
+gain table runs 0 = +21 dB .. 18 = -6 dB; the old "12" was about -7.5 dB and
+users found the speakers far too quiet). 17 is the cap the sc8280xp machine
+driver enforces. Something (UCM/state restore on a PipeWire restart) can put
+it back, so it is re-applied with the digital stage.
 Runs as the session user (systemd --user; member of the audio group).
 """
 from __future__ import annotations
@@ -32,6 +37,8 @@ import time
 SINK = "alsa_output.platform-sound.HiFi__Speaker__sink"
 CARD = "0"
 DIGITAL = ("WSA_RX0 Digital Volume", "WSA_RX1 Digital Volume")
+PA = "Speakers Volume"
+PA_LEVEL = "17,17"
 
 
 def run(*cmd: str) -> str:
@@ -105,6 +112,7 @@ class Volume:
             if not self.nid:
                 return
             if force or self.last != (steps, soft):
+                run("amixer", "-c", CARD, "-q", "cset", f"name={PA}", PA_LEVEL)
                 for ctl in DIGITAL:
                     run("amixer", "-c", CARD, "-q", "cset", f"name={ctl}", str(steps))
             cur = self.soft()
@@ -127,6 +135,8 @@ def main() -> None:
             time.sleep(3)
             vol.nid = None
             vol.apply()
+            if "values=17,17" not in run("amixer", "-c", CARD, "cget", f"name={PA}"):
+                vol.apply(force=True)
 
     threading.Thread(target=periodic, daemon=True).start()
     while True:

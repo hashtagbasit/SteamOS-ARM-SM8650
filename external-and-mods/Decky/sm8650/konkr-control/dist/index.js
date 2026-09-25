@@ -164,11 +164,32 @@ function Content() {
     ] });
 }
 
-var index = definePlugin(() => ({
-    name: "KONKR Control",
-    content: jsx(Content, {}),
-    icon: jsx("div", { style: { fontWeight: 800 }, children: "K" }),
-    alwaysRender: false,
-}));
+// Toast whenever the profile or fan boost changes (KONKR button, konkrctl or
+// this panel), like Android's on-screen mode switch. Registered at plugin
+// load, so it works with Quick Access closed and over games.
+const MODE_TOAST = {
+    silent: { title: "🌙  Silent", body: "Quiet fan, GPU capped" },
+    balanced: { title: "⚖️  Balanced", body: "Full clocks on demand" },
+    turbo: { title: "⚡  Turbo", body: "Maximum performance, fan aggressive" },
+};
+function onMode(profile, boost, profileChanged) {
+    const t = profileChanged
+        ? MODE_TOAST[profile] || { title: profile, body: "" }
+        : { title: boost ? "🌀  Fan boost on" : "🌀  Fan boost off", body: (MODE_TOAST[profile] || {}).title || "" };
+    toaster.toast({ title: t.title, body: t.body, duration: 2000, playSound: false, critical: true });
+}
+
+var index = definePlugin(() => {
+    api.addEventListener("konkr_mode", onMode);
+    return {
+        name: "KONKR Control",
+        content: jsx(Content, {}),
+        icon: jsx("div", { style: { fontWeight: 800 }, children: "K" }),
+        alwaysRender: false,
+        onDismount() {
+            api.removeEventListener("konkr_mode", onMode);
+        },
+    };
+});
 
 export { index as default };

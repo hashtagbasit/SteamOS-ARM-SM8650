@@ -1,0 +1,5 @@
+[Default Applications]
+application/vnd.android.package-archive=konkr-apk.desktop
+application/x-apkm=konkr-apk.desktop
+application/x-xapk=konkr-apk.desktop
+application/x-apks=konkr-apk.desktop
