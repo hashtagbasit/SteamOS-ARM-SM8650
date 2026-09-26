@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/capability_map_v2.json
+# AYANEO Pocket S2 auxiliary buttons ("AYANEO DEVICE", 1c4f:0002). Codes
+# from upstream ayaneo_type9 (50-ayaneo_pocket_s2.yaml).
+version: 2
+kind: CapabilityMap
+name: AYANEO Pocket S2 aux buttons (Steam Deck layout)
+id: ayaneo_pocket_s2_aux
+
+mapping:
+  - name: AYANEO button
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN6, value_type: button}
+    target_event:
+      gamepad: {button: QuickAccess}
+  - name: AYANEO button 2
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN5, value_type: button}
+    target_event:
+      gamepad: {button: Screenshot}
+  - name: L4
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN3, value_type: button}
+    target_event:
+      gamepad: {button: LeftPaddle1}
+  - name: R4
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN4, value_type: button}
+    target_event:
+      gamepad: {button: RightPaddle1}
+  - name: Side button
+    source_events:
+      - evdev: {event_type: KEY, event_code: BTN7, value_type: button}
+    target_event:
+      gamepad: {button: Keyboard}
+
+filtered_events: []

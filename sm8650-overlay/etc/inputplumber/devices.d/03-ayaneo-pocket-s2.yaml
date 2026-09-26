@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
-# KONKR Pocket FIT (SM8650) → virtual Steam Deck controller (deck-uhid; valid
+# AYANEO Pocket S2 (SM8650) → virtual Steam Deck controller (deck-uhid; valid
 # in InputPlumber ≥ 0.70 even though the bundled JSON schema does not list it)
 # + keyboard (OSK, F13/F14 hotkeys).
 #
@@ -7,22 +7,22 @@
 # (upstream InputPlumber PR #670 documents both):
 #   - XInput:      "Microsoft X-Box 360 pad" 045e:028e (xpad: triggers Z/RZ)
 #   - DirectInput: "AYANEO Controller" 4001:0428 (right stick Z/RZ, triggers
-#                  Brake/Gas) + "AYANEO DEVICE" 1c4f:0002 for the menu/K/=/LC/RC
+#                  Brake/Gas) + "AYANEO DEVICE" 1c4f:0002 for the AYANEO/side/L4/R4
 #                  buttons
-# plus, when the konkr-mcu link is up, "KONKR System Buttons".
+# (upstream InputPlumber 50-ayaneo_pocket_s2.yaml has the same layout).
 # Sources are optional: the composite forms from whichever appear. The first
 # matching source entry wins, so the id-specific ones come before the
 # port-based fallback.
 version: 1
 kind: CompositeDevice
-name: KONKR Pocket FIT
+name: AYANEO Pocket S2
 
 matches:
   - udev:
       sys_path: /sys/firmware/devicetree/base
       attributes:
         - name: model
-          value: KONKR Pocket FIT
+          value: AYANEO Pocket S2
 
 single_source: false
 
@@ -44,7 +44,7 @@ source_devices:
       vendor_id: "1c4f"
       product_id: "0002"
       handler: event*
-    capability_map_id: konkr_pocketfit_aux
+    capability_map_id: ayaneo_pocket_s2_aux
   # Whatever else is on the pad's internal USB port (port 2 on some units,
   # 1 on others): unclaimed, Steam shows the raw pad with the Xbox layout and
   # no Quick Access. InputPlumber matches phys_path literally (no globs).
@@ -58,11 +58,6 @@ source_devices:
       phys_path: usb-0001:01:00.0-1/input0
       handler: event*
     capability_map_id: konkr_pocketfit_deck
-  - group: gamepad
-    evdev:
-      name: KONKR System Buttons
-      handler: event*
-    capability_map_id: konkr_pocketfit_sysbtn
 
 options:
   auto_manage: true
